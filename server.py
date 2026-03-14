@@ -6,7 +6,7 @@ import math
 
 app = Flask(__name__)
 
-EXCEL_FILE = r"C:\transport management system\transport_data.xlsx"
+EXCEL_FILE = "transport_data.xlsx"
 
 COLLEGE_LAT = 13.013396
 COLLEGE_LON = 79.132097
