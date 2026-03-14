@@ -73,9 +73,11 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 
 @app.route("/getBuses")
 def get_buses():
-    return["BUS1","BUS2"]
 
+    df = pd.read_excel(EXCEL_FILE, sheet_name="Buses")
+    buses = df["bus_id"].tolist()
 
+    return jsonify(buses)
 # ---------------- STUDENT LOGIN ----------------
 
 @app.route("/studentLogin", methods=["POST"])
