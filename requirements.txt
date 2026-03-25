@@ -2,3 +2,5 @@ flask
 pandas
 openpyxl
 gunicorn
+face_recognition
+Pillow 
