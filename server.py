@@ -6,7 +6,10 @@ import math
 import time
 import os
 import numpy as np
+import base64
+from io import BytesIO
 from datetime import datetime, timedelta
+from PIL import Image
 
 # Face recognition imports
 try:
@@ -60,6 +63,20 @@ CREATE TABLE IF NOT EXISTS face_attendance (
     student_id TEXT,
     bus_id TEXT,
     time TEXT,
+    status TEXT
+)
+""")
+
+# 🔥 Create SOS alerts table
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS sos_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id TEXT,
+    bus_id TEXT,
+    latitude REAL,
+    longitude REAL,
+    location_name TEXT,
+    timestamp TEXT,
     status TEXT
 )
 """)
@@ -321,6 +338,25 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 
+# ==================== ROUTES ====================
+
+@app.route("/")
+def home():
+    """Home route to check if server is running"""
+    return jsonify({
+        "status": "running",
+        "message": "College Transport System API",
+        "features": [
+            "Real-time bus tracking",
+            "Face recognition attendance",
+            "Emergency alerts",
+            "Anomaly detection",
+            "Geo-fencing",
+            "Voice assistant"
+        ]
+    })
+
+
 # ---------------- GET BUSES ----------------
 
 @app.route("/getBuses")
@@ -353,6 +389,26 @@ def student_login():
         "status":"success",
         "bus_id":bus
     })
+
+
+# 🔥🔥🔥 NEW: GET STUDENTS BY BUS (FIX) 🔥🔥🔥
+@app.route("/getStudentsByBus/<bus_id>")
+def get_students_by_bus(bus_id):
+    """Get all students assigned to a specific bus"""
+    try:
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+        
+        # Filter students by bus_id
+        students = df[df["bus_id"] == bus_id]
+        
+        # Convert to list of dictionaries
+        result = students[["reg_no", "name"]].to_dict(orient="records")
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        print(f"Error getting students: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------- BUS CROWD PREDICTION ----------------
@@ -489,6 +545,161 @@ def get_location(bus_id):
     })
 
 
+# 🔥🔥🔥 NEW: FACE RECOGNITION API (FIX) 🔥🔥🔥
+@app.route("/recognizeFace", methods=["POST"])
+def recognize_face():
+    """Recognize face from image and return student ID"""
+    
+    if not FACE_RECOGNITION_AVAILABLE:
+        return jsonify({
+            "status": "error", 
+            "message": "Face recognition library not installed"
+        })
+
+    try:
+        data = request.json
+        image_data = data.get("image", "")
+        
+        if not image_data:
+            return jsonify({"status": "error", "message": "No image data"})
+        
+        # Decode base64 image
+        image_bytes = base64.b64decode(image_data)
+        image = Image.open(BytesIO(image_bytes))
+        image = np.array(image)
+        
+        # Detect faces
+        face_locations = face_recognition.face_locations(image)
+        face_encodings = face_recognition.face_encodings(image, face_locations)
+        
+        if not face_encodings:
+            return jsonify({"status": "unknown", "message": "No face detected"})
+        
+        face_encoding = face_encodings[0]
+        
+        if not known_face_encodings:
+            return jsonify({"status": "error", "message": "No registered faces found"})
+        
+        # Compare with known faces
+        matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+        face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+        
+        best_match_index = np.argmin(face_distances)
+        
+        if matches[best_match_index]:
+            student_id = known_face_ids[best_match_index]
+            confidence = float(1 - face_distances[best_match_index])
+            
+            return jsonify({
+                "status": "recognized",
+                "reg_no": student_id,
+                "name": student_id,
+                "confidence": round(confidence, 2)
+            })
+        
+        return jsonify({"status": "unknown", "message": "Face not recognized"})
+        
+    except Exception as e:
+        print(f"Face recognition error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# 🔥🔥🔥 NEW: SOS ALERT API (FIX) 🔥🔥🔥
+@app.route("/sendAlert", methods=["POST"])
+def send_alert():
+    """Receive SOS alert from student"""
+    try:
+        data = request.json
+        
+        student_id = data.get("student_id", "Unknown")
+        bus_id = data.get("bus_id", "Unknown")
+        latitude = data.get("latitude", 0)
+        longitude = data.get("longitude", 0)
+        location_name = data.get("location_name", "Unknown")
+        
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        print("🚨 SOS ALERT RECEIVED!")
+        print(f"   Student: {student_id}")
+        print(f"   Bus: {bus_id}")
+        print(f"   Location: {location_name}")
+        print(f"   Coordinates: {latitude}, {longitude}")
+        print(f"   Time: {current_time}")
+        
+        # Save to database
+        cursor.execute("""
+            INSERT INTO sos_alerts (student_id, bus_id, latitude, longitude, location_name, timestamp, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (student_id, bus_id, latitude, longitude, location_name, current_time, "active"))
+        conn.commit()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Alert received and forwarded to driver and admin",
+            "alert_id": cursor.lastrowid
+        })
+        
+    except Exception as e:
+        print(f"SOS alert error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# 🔥 NEW: GET ACTIVE SOS ALERTS
+@app.route("/getSOSAlerts")
+def get_sos_alerts():
+    """Get all active SOS alerts"""
+    try:
+        cursor.execute("""
+            SELECT * FROM sos_alerts 
+            WHERE status = 'active'
+            ORDER BY timestamp DESC
+        """)
+        
+        rows = cursor.fetchall()
+        alerts = []
+        
+        for row in rows:
+            alerts.append({
+                "id": row[0],
+                "student_id": row[1],
+                "bus_id": row[2],
+                "latitude": row[3],
+                "longitude": row[4],
+                "location_name": row[5],
+                "timestamp": row[6],
+                "status": row[7]
+            })
+        
+        return jsonify({"alerts": alerts, "count": len(alerts)})
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# 🔥 NEW: RESOLVE SOS ALERT
+@app.route("/resolveSOSAlert", methods=["POST"])
+def resolve_sos_alert():
+    """Resolve an SOS alert"""
+    try:
+        data = request.json
+        alert_id = data["alert_id"]
+        
+        cursor.execute("""
+            UPDATE sos_alerts 
+            SET status = 'resolved' 
+            WHERE id = ?
+        """, (alert_id,))
+        conn.commit()
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Alert {alert_id} resolved"
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # 🔥 NEW: GET ALL ANOMALIES
 @app.route("/getAnomalies")
 def get_anomalies():
@@ -608,10 +819,10 @@ def analytics():
     })
 
 
-# 🔥 NEW: FACE RECOGNITION ATTENDANCE API
+# 🔥 NEW: FACE ATTENDANCE API (Alternative endpoint)
 @app.route("/faceAttendance", methods=["POST"])
 def face_attendance_api():
-    """Mark attendance using face recognition"""
+    """Mark attendance using face recognition (alternative endpoint)"""
     
     if not FACE_RECOGNITION_AVAILABLE:
         return jsonify({
@@ -684,6 +895,37 @@ def face_attendance_api():
 def get_face_attendance():
     """Get face attendance history"""
     return jsonify(face_attendance)
+
+
+# 🔥 NEW: MARK ATTENDANCE API
+@app.route("/markAttendance", methods=["POST"])
+def mark_attendance():
+    """Mark attendance for students"""
+    try:
+        data = request.json
+        bus_id = data.get("bus_id")
+        records = data.get("records", [])
+        
+        current_time = datetime.now().isoformat()
+        
+        for record in records:
+            reg_no = record.get("reg_no")
+            present = record.get("present")
+            
+            if present:
+                cursor.execute("""
+                    INSERT INTO face_attendance (student_id, bus_id, time, status)
+                    VALUES (?, ?, ?, ?)
+                """, (reg_no, bus_id, current_time, "Present"))
+                conn.commit()
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Attendance marked for {len(records)} students"
+        })
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 # 🔥 NEW: VOICE ASSISTANT API
@@ -847,6 +1089,13 @@ def dashboard():
     # 🔥 Count anomalies for dashboard
     anomaly_count = len(bus_anomalies)
     
+    # Get SOS alert count
+    try:
+        cursor.execute("SELECT COUNT(*) FROM sos_alerts WHERE status = 'active'")
+        sos_count = cursor.fetchone()[0]
+    except:
+        sos_count = 0
+    
     # Calculate average speed
     avg_speed = sum(speed_records) / len(speed_records) if speed_records else 0
 
@@ -856,6 +1105,7 @@ def dashboard():
         "students": total_students,
         "emergency": emergency_count,
         "anomalies": anomaly_count,
+        "sos_alerts": sos_count,
         "average_speed": round(avg_speed, 2)
     })
 
@@ -873,5 +1123,20 @@ if __name__ == "__main__":
     print(f"🚨 Anomaly detection: Active")
     print(f"👨‍✈️ Driver behavior: Monitoring")
     print(f"🎤 Voice assistant: Ready")
+    print(f"🚨 SOS Alerts: Active")
+    print("="*50)
+    print("\n✅ Available Endpoints:")
+    print("   / - Home")
+    print("   /getBuses - List all buses")
+    print("   /studentLogin - Student login")
+    print("   /getStudentsByBus/<bus_id> - Get students in a bus")
+    print("   /recognizeFace - Face recognition")
+    print("   /sendAlert - SOS alert")
+    print("   /sendLocation - Update bus location")
+    print("   /getLocation/<bus_id> - Get bus location")
+    print("   /getAnomalies - Get active anomalies")
+    print("   /getSOSAlerts - Get active SOS alerts")
+    print("   /analytics - System analytics")
+    print("   /dashboard - Dashboard data")
     print("="*50 + "\n")
     app.run(host="0.0.0.0", port=5000, debug=True)
