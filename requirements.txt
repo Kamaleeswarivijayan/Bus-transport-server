@@ -3,3 +3,6 @@ pandas
 openpyxl
 gunicorn
 Pillow 
+flask-cors
+opencv-python-headless
+numpy
