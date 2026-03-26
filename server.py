@@ -10,14 +10,7 @@ import base64
 from io import BytesIO
 from datetime import datetime, timedelta
 from PIL import Image
-
-# Face recognition imports
-try:
-    import face_recognition
-    FACE_RECOGNITION_AVAILABLE = True
-except ImportError:
-    FACE_RECOGNITION_AVAILABLE = False
-    print("⚠️ Face_recognition not installed. Install with: pip install face_recognition")
+import cv2
 
 app = Flask(__name__)
 
@@ -32,6 +25,7 @@ GATE_RADIUS = 0.2
 conn = sqlite3.connect("transport.db", check_same_thread=False)
 cursor = conn.cursor()
 
+# Bus log table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS bus_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +36,7 @@ CREATE TABLE IF NOT EXISTS bus_log (
 )
 """)
 
-# 🔥 Create anomaly logs table
+# Anomaly logs table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS anomaly_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,7 +50,7 @@ CREATE TABLE IF NOT EXISTS anomaly_logs (
 )
 """)
 
-# 🔥 Create face attendance table
+# Face attendance table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS face_attendance (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +61,7 @@ CREATE TABLE IF NOT EXISTS face_attendance (
 )
 """)
 
-# 🔥 Create SOS alerts table
+# SOS alerts table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS sos_alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +75,61 @@ CREATE TABLE IF NOT EXISTS sos_alerts (
 )
 """)
 
+# Route history table
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS route_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bus_id TEXT,
+    latitude REAL,
+    longitude REAL,
+    speed REAL,
+    timestamp TEXT,
+    date TEXT
+)
+""")
+
 conn.commit()
+
+# ---------------- LIGHTWEIGHT FACE RECOGNITION ----------------
+
+KNOWN_FACES_DIR = "faces"
+known_faces = {}
+
+def load_known_faces():
+    """Load all student face images using OpenCV (lightweight)"""
+    print("\n" + "="*50)
+    print("📸 LOADING FACES (LIGHTWEIGHT MODE)")
+    print("="*50)
+    
+    if not os.path.exists(KNOWN_FACES_DIR):
+        os.makedirs(KNOWN_FACES_DIR)
+        print(f"✅ Created {KNOWN_FACES_DIR} folder")
+        print("   Add student images as 'register_number.jpg'")
+        return
+    
+    count = 0
+    for file in os.listdir(KNOWN_FACES_DIR):
+        if file.endswith((".jpg", ".jpeg", ".png")):
+            path = os.path.join(KNOWN_FACES_DIR, file)
+            img = cv2.imread(path)
+            
+            if img is None:
+                print(f"⚠️ Could not read {file}")
+                continue
+            
+            # Convert to grayscale
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            student_id = os.path.splitext(file)[0]
+            
+            known_faces[student_id] = gray
+            count += 1
+            print(f"✅ Loaded: {student_id}")
+    
+    print(f"\n✅ Total faces loaded: {count}")
+    print("="*50 + "\n")
+
+# Load faces on startup
+load_known_faces()
 
 # ---------------- ANOMALY TRACKING ----------------
 
@@ -117,44 +165,9 @@ driver_behavior = {}
 speed_records = []
 delay_records = []
 
-# ---------------- FACE ATTENDANCE ----------------
+# ---------------- FACE ATTENDANCE RECORDS ----------------
 
 face_attendance = []
-known_face_encodings = []
-known_face_ids = []
-
-def load_known_faces():
-    """Load all student face images from faces/ folder"""
-    if not FACE_RECOGNITION_AVAILABLE:
-        print("Face recognition not available")
-        return
-    
-    folder = "faces"
-    
-    if not os.path.exists(folder):
-        os.makedirs(folder)
-        print(f"Created {folder} folder. Add student images as 'register_number.jpg'")
-        return
-    
-    for file in os.listdir(folder):
-        if file.endswith((".jpg", ".jpeg", ".png")):
-            path = os.path.join(folder, file)
-            try:
-                image = face_recognition.load_image_file(path)
-                encodings = face_recognition.face_encodings(image)
-                
-                if encodings:
-                    known_face_encodings.append(encodings[0])
-                    student_id = os.path.splitext(file)[0]
-                    known_face_ids.append(student_id)
-                    print(f"✅ Loaded face for student: {student_id}")
-                else:
-                    print(f"⚠️ No face detected in {file}")
-            except Exception as e:
-                print(f"❌ Error loading {file}: {e}")
-
-# Load faces on startup
-load_known_faces()
 
 # ---------------- ANOMALY DETECTION FUNCTION ----------------
 
@@ -307,11 +320,12 @@ def home():
         "message": "College Transport System API",
         "features": [
             "Real-time bus tracking",
-            "Face recognition attendance",
+            "Lightweight face recognition attendance",
             "Emergency alerts",
             "Anomaly detection",
             "Geo-fencing",
-            "Voice assistant"
+            "Voice assistant",
+            "Route history tracking"
         ]
     })
 
@@ -336,31 +350,27 @@ def student_login():
     bus = student.iloc[0]["bus_id"]
     return jsonify({"status":"success","bus_id":bus})
 
-# 🔥🔥🔥 CRITICAL FIX: GET STUDENTS BY BUS API 🔥🔥🔥
+# ---------------- GET STUDENTS BY BUS ----------------
+
 @app.route("/getStudentsByBus/<bus_id>")
 def get_students_by_bus(bus_id):
     """Get all students assigned to a specific bus"""
     try:
         print(f"📚 Fetching students for bus: {bus_id}")
         
-        # Read Excel file
         df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
         
         print(f"📊 Total students in Excel: {len(df)}")
         print(f"📊 Columns: {df.columns.tolist()}")
         
-        # Convert bus_id column to string for comparison
         df['bus_id'] = df['bus_id'].astype(str)
         
-        # Filter students by bus_id
         students = df[df["bus_id"] == str(bus_id)]
         
         print(f"✅ Found {len(students)} students for bus {bus_id}")
         
-        # Convert to list of dictionaries
         result = students[["reg_no", "name"]].to_dict(orient="records")
         
-        # Print sample for debugging
         if result:
             print(f"📝 Sample student: {result[0]}")
         else:
@@ -394,7 +404,7 @@ def get_stops(bus_id):
     stops = df[df["bus_id"] == bus_id]
     return jsonify(stops.to_dict(orient="records"))
 
-# ---------------- SAVE BUS LOCATION ----------------
+# ---------------- SAVE BUS LOCATION (WITH ROUTE HISTORY) ----------------
 
 bus_locations = {}
 
@@ -432,6 +442,25 @@ def send_location():
     if len(delay_records) > 1000:
         delay_records.pop(0)
 
+    # Save route history
+    try:
+        current_time = datetime.now()
+        cursor.execute("""
+            INSERT INTO route_history (bus_id, latitude, longitude, speed, timestamp, date)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            bus_id,
+            latitude,
+            longitude,
+            speed,
+            current_time.strftime("%Y-%m-%d %H:%M:%S"),
+            current_time.strftime("%Y-%m-%d")
+        ))
+        conn.commit()
+        print(f"📍 Route saved for {bus_id}: ({latitude}, {longitude})")
+    except Exception as e:
+        print(f"❌ Route save error: {e}")
+
     return jsonify({
         "status": "ok",
         "anomaly": anomaly,
@@ -460,14 +489,224 @@ def get_location(bus_id):
     
     return jsonify({"latitude":0, "longitude":0, "delay":"Unknown"})
 
-# 🔥🔥🔥 FACE RECOGNITION API 🔥🔥🔥
+# ---------------- GET ROUTE HISTORY ----------------
+
+@app.route("/getRouteHistory/<bus_id>")
+def get_route_history(bus_id):
+    """Get route history for a specific bus"""
+    try:
+        date_filter = request.args.get("date", None)
+        
+        if date_filter:
+            cursor.execute("""
+                SELECT latitude, longitude, speed, timestamp
+                FROM route_history
+                WHERE bus_id = ? AND date = ?
+                ORDER BY timestamp ASC
+            """, (bus_id, date_filter))
+        else:
+            cursor.execute("""
+                SELECT latitude, longitude, speed, timestamp
+                FROM route_history
+                WHERE bus_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 500
+            """, (bus_id,))
+        
+        rows = cursor.fetchall()
+        
+        data = []
+        for row in rows:
+            data.append({
+                "lat": row[0],
+                "lon": row[1],
+                "speed": row[2],
+                "time": row[3]
+            })
+        
+        return jsonify({
+            "bus_id": bus_id,
+            "points": data,
+            "count": len(data)
+        })
+        
+    except Exception as e:
+        print(f"❌ Route history error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- DOWNLOAD ROUTE CSV ----------------
+
+@app.route("/downloadRouteCSV/<bus_id>")
+def download_route_csv(bus_id):
+    """Download route history as CSV file"""
+    try:
+        date_filter = request.args.get("date", None)
+        
+        if date_filter:
+            cursor.execute("""
+                SELECT latitude, longitude, speed, timestamp
+                FROM route_history
+                WHERE bus_id = ? AND date = ?
+                ORDER BY timestamp ASC
+            """, (bus_id, date_filter))
+        else:
+            cursor.execute("""
+                SELECT latitude, longitude, speed, timestamp
+                FROM route_history
+                WHERE bus_id = ?
+                ORDER BY timestamp ASC
+            """, (bus_id,))
+        
+        rows = cursor.fetchall()
+        
+        if not rows:
+            return jsonify({"error": "No route data found"}), 404
+        
+        filename = f"{bus_id}_route_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        with open(filename, "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["Latitude", "Longitude", "Speed (km/h)", "Timestamp"])
+            writer.writerows(rows)
+        
+        return send_file(filename, as_attachment=True, download_name=filename)
+        
+    except Exception as e:
+        print(f"❌ CSV download error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- GET ROUTE SUMMARY ----------------
+
+@app.route("/getRouteSummary/<bus_id>")
+def get_route_summary(bus_id):
+    """Get summary statistics for route"""
+    try:
+        date_filter = request.args.get("date", None)
+        
+        if date_filter:
+            cursor.execute("""
+                SELECT COUNT(*) as point_count,
+                       MIN(timestamp) as start_time,
+                       MAX(timestamp) as end_time,
+                       AVG(speed) as avg_speed,
+                       MAX(speed) as max_speed
+                FROM route_history
+                WHERE bus_id = ? AND date = ?
+            """, (bus_id, date_filter))
+        else:
+            cursor.execute("""
+                SELECT COUNT(*) as point_count,
+                       MIN(timestamp) as start_time,
+                       MAX(timestamp) as end_time,
+                       AVG(speed) as avg_speed,
+                       MAX(speed) as max_speed
+                FROM route_history
+                WHERE bus_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 1000
+            """, (bus_id,))
+        
+        row = cursor.fetchone()
+        
+        return jsonify({
+            "bus_id": bus_id,
+            "point_count": row[0] if row else 0,
+            "start_time": row[1] if row else None,
+            "end_time": row[2] if row else None,
+            "average_speed": round(row[3], 2) if row and row[3] else 0,
+            "max_speed": round(row[4], 2) if row and row[4] else 0
+        })
+        
+    except Exception as e:
+        print(f"❌ Route summary error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- FACE ATTENDANCE API (LIGHTWEIGHT) ----------------
+
+@app.route("/faceAttendance", methods=["POST"])
+def face_attendance_api():
+    """Face recognition attendance using lightweight image comparison"""
+    print("📸 API HIT")  
+    if 'image' not in request.files:
+        return jsonify({"status": "failed", "message": "No image uploaded"})
+
+    file = request.files['image']
+    bus_id = request.form.get("bus_id", "Unknown")
+
+    try:
+        # Convert image bytes to numpy array
+        file_bytes = np.frombuffer(file.read(), np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+        if img is None:
+            return jsonify({"status": "failed", "message": "Invalid image format"})
+
+        # Convert to grayscale for comparison
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        if not known_faces:
+            return jsonify({"status": "failed", "message": "No student faces loaded. Add images to faces/ folder"})
+
+        # Compare with known faces using Mean Squared Error
+        best_match = None
+        best_score = float('inf')
+        
+        for student_id, known_img in known_faces.items():
+            # Resize to match known image dimensions
+            resized = cv2.resize(gray, (known_img.shape[1], known_img.shape[0]))
+            
+            # Calculate Mean Squared Error (lower is better)
+            diff = np.mean((resized.astype(float) - known_img.astype(float)) ** 2)
+            
+            if diff < best_score:
+                best_score = diff
+                best_match = student_id
+        
+        # Threshold for face recognition (adjust if needed)
+        if best_score < 2000:
+            current_time = datetime.now().isoformat()
+            
+            # Save attendance
+            cursor.execute("""
+                INSERT INTO face_attendance (student_id, bus_id, time, status)
+                VALUES (?, ?, ?, ?)
+            """, (best_match, bus_id, current_time, "Present"))
+            conn.commit()
+            
+            face_attendance.append({
+                "student_id": best_match,
+                "bus_id": bus_id,
+                "time": current_time,
+                "status": "Present"
+            })
+            
+            print(f"✅ Attendance marked for {best_match} (score: {best_score:.2f})")
+            
+            return jsonify({
+                "status": "success",
+                "message": f"Attendance marked for {best_match}",
+                "data": {
+                    "student_id": best_match,
+                    "bus_id": bus_id,
+                    "time": current_time
+                }
+            })
+        else:
+            return jsonify({
+                "status": "failed",
+                "message": f"Face not recognized (score: {best_score:.2f})"
+            })
+
+    except Exception as e:
+        print(f"❌ Face attendance error: {e}")
+        return jsonify({"status": "error", "message": f"Error: {str(e)}"})
+
+# ---------------- FACE RECOGNITION API (Base64 - Compatibility) ----------------
+
 @app.route("/recognizeFace", methods=["POST"])
 def recognize_face():
-    """Recognize face from base64 image"""
+    """Recognize face from base64 image (compatibility)"""
     
-    if not FACE_RECOGNITION_AVAILABLE:
-        return jsonify({"status": "error", "message": "Face recognition library not installed"})
-
     try:
         data = request.json
         image_data = data.get("image", "")
@@ -477,37 +716,37 @@ def recognize_face():
         
         # Decode base64 image
         image_bytes = base64.b64decode(image_data)
-        image = Image.open(BytesIO(image_bytes))
-        image = np.array(image)
+        img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
         
-        # Detect faces
-        face_locations = face_recognition.face_locations(image)
-        face_encodings = face_recognition.face_encodings(image, face_locations)
+        if img is None:
+            return jsonify({"status": "error", "message": "Invalid image format"})
         
-        if not face_encodings:
-            return jsonify({"status": "unknown", "message": "No face detected"})
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        face_encoding = face_encodings[0]
-        
-        if not known_face_encodings:
+        if not known_faces:
             return jsonify({"status": "error", "message": "No registered faces found. Add images to faces/ folder"})
         
         # Compare with known faces
-        matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
-        face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+        best_match = None
+        best_score = float('inf')
         
-        best_match_index = np.argmin(face_distances)
-        
-        if matches[best_match_index]:
-            student_id = known_face_ids[best_match_index]
-            confidence = float(1 - face_distances[best_match_index])
+        for student_id, known_img in known_faces.items():
+            resized = cv2.resize(gray, (known_img.shape[1], known_img.shape[0]))
+            diff = np.mean((resized.astype(float) - known_img.astype(float)) ** 2)
             
-            print(f"✅ Face recognized: Student {student_id} (confidence: {confidence:.2f})")
+            if diff < best_score:
+                best_score = diff
+                best_match = student_id
+        
+        if best_score < 2000:
+            confidence = max(0, min(100, 100 - (best_score / 20)))
+            print(f"✅ Face recognized: Student {best_match} (confidence: {confidence:.2f}%)")
             
             return jsonify({
                 "status": "recognized",
-                "reg_no": student_id,
-                "name": student_id,
+                "reg_no": best_match,
+                "name": best_match,
                 "confidence": round(confidence, 2)
             })
         
@@ -517,7 +756,8 @@ def recognize_face():
         print(f"❌ Face recognition error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# 🔥🔥🔥 SOS ALERT API 🔥🔥🔥
+# ---------------- SOS ALERT API ----------------
+
 @app.route("/sendAlert", methods=["POST"])
 def send_alert():
     """Receive SOS alert from student"""
@@ -542,7 +782,6 @@ def send_alert():
         print(f"   ⏰ Time: {current_time}")
         print("="*50 + "\n")
         
-        # Save to database
         cursor.execute("""
             INSERT INTO sos_alerts (student_id, bus_id, latitude, longitude, location_name, timestamp, status)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -559,7 +798,8 @@ def send_alert():
         print(f"❌ SOS alert error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# 🔥 NEW: GET ACTIVE SOS ALERTS
+# ---------------- GET ACTIVE SOS ALERTS ----------------
+
 @app.route("/getSOSAlerts")
 def get_sos_alerts():
     try:
@@ -589,7 +829,8 @@ def get_sos_alerts():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 🔥 NEW: RESOLVE SOS ALERT
+# ---------------- RESOLVE SOS ALERT ----------------
+
 @app.route("/resolveSOSAlert", methods=["POST"])
 def resolve_sos_alert():
     try:
@@ -608,7 +849,8 @@ def resolve_sos_alert():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 🔥 NEW: GET ALL ANOMALIES
+# ---------------- GET ALL ANOMALIES ----------------
+
 @app.route("/getAnomalies")
 def get_anomalies():
     anomalies_list = []
@@ -623,7 +865,8 @@ def get_anomalies():
         })
     return jsonify({"anomalies": anomalies_list, "count": len(anomalies_list)})
 
-# 🔥 NEW: GET ANOMALY HISTORY
+# ---------------- GET ANOMALY HISTORY ----------------
+
 @app.route("/getAnomalyHistory")
 def get_anomaly_history():
     try:
@@ -652,7 +895,8 @@ def get_anomaly_history():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 🔥 NEW: RESOLVE ANOMALY
+# ---------------- RESOLVE ANOMALY ----------------
+
 @app.route("/resolveAnomaly", methods=["POST"])
 def resolve_anomaly():
     data = request.json
@@ -675,17 +919,20 @@ def resolve_anomaly():
     
     return jsonify({"status": "error", "message": "No active anomaly found for this bus"})
 
-# 🔥 NEW: GET GEO-FENCING ALERTS
+# ---------------- GET GEO-FENCING ALERTS ----------------
+
 @app.route("/getGeoAlerts")
 def get_geo_alerts():
     return jsonify(geo_alerts)
 
-# 🔥 NEW: GET DRIVER BEHAVIOR
+# ---------------- GET DRIVER BEHAVIOR ----------------
+
 @app.route("/getDriverBehavior")
 def get_driver_behavior():
     return jsonify(driver_behavior)
 
-# 🔥 NEW: ANALYTICS API
+# ---------------- ANALYTICS API ----------------
+
 @app.route("/analytics")
 def analytics():
     avg_speed = sum(speed_records) / len(speed_records) if speed_records else 0
@@ -701,7 +948,8 @@ def analytics():
         "anomaly_count": len(bus_anomalies)
     })
 
-# 🔥 NEW: MARK ATTENDANCE API
+# ---------------- MARK ATTENDANCE API ----------------
+
 @app.route("/markAttendance", methods=["POST"])
 def mark_attendance():
     try:
@@ -727,12 +975,14 @@ def mark_attendance():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# 🔥 NEW: GET FACE ATTENDANCE HISTORY
+# ---------------- GET FACE ATTENDANCE HISTORY ----------------
+
 @app.route("/getFaceAttendance")
 def get_face_attendance():
     return jsonify(face_attendance)
 
-# 🔥 NEW: VOICE ASSISTANT API
+# ---------------- VOICE ASSISTANT API ----------------
+
 @app.route("/voiceCommand", methods=["POST"])
 def voice_command():
     data = request.json
@@ -770,6 +1020,9 @@ def voice_command():
     
     elif "bus count" in command or "how many buses" in command:
         return jsonify({"response": f"There are {len(bus_locations)} buses currently active."})
+    
+    elif "route" in command or "history" in command:
+        return jsonify({"response": f"Route history available for buses. Use download route feature in admin panel."})
     
     else:
         return jsonify({"response": "Sorry, I didn't understand. Try: bus location, bus status, analytics, anomalies, emergency, or bus count."})
@@ -827,7 +1080,9 @@ def download_report():
         for r in rows:
             writer.writerow([r[1],r[2],r[3],r[4]])
     return send_file(filename,as_attachment=True)
-
+@app.route("/test")
+def test():
+    return "Server Running"
 # ---------------- DASHBOARD ----------------
 
 @app.route("/dashboard")
@@ -842,6 +1097,12 @@ def dashboard():
     except:
         sos_count = 0
     
+    try:
+        cursor.execute("SELECT COUNT(*) FROM route_history")
+        route_count = cursor.fetchone()[0]
+    except:
+        route_count = 0
+    
     avg_speed = sum(speed_records) / len(speed_records) if speed_records else 0
 
     return jsonify({
@@ -851,6 +1112,7 @@ def dashboard():
         "emergency": 0,
         "anomalies": anomaly_count,
         "sos_alerts": sos_count,
+        "route_points": route_count,
         "average_speed": round(avg_speed, 2)
     })
 
@@ -860,7 +1122,7 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("🚀 TRANSPORT SYSTEM SERVER STARTED")
     print("="*60)
-    print(f"📊 Face Recognition: {'✅ Available' if FACE_RECOGNITION_AVAILABLE else '❌ Not installed'}")
+    print(f"📊 Face Recognition: ✅ Lightweight Mode (OpenCV)")
     print(f"📁 Faces folder: {'faces/'}")
     print(f"📁 Excel file: {EXCEL_FILE}")
     print(f"🔔 Geo-fencing: Enabled with {len(BUS_STOPS)} stops")
@@ -868,12 +1130,18 @@ if __name__ == "__main__":
     print(f"👨‍✈️ Driver behavior: Monitoring")
     print(f"🎤 Voice assistant: Ready")
     print(f"🚨 SOS Alerts: Active")
+    print(f"🗺️ Route History: Active")
     print("="*60)
     print("\n✅ Critical Endpoints:")
-    print("   📍 /getStudentsByBus/<bus_id> - GET STUDENTS (FIXED!)")
-    print("   👤 /recognizeFace - Face recognition")
+    print("   📍 /getStudentsByBus/<bus_id> - GET STUDENTS")
+    print("   👤 /faceAttendance - Face recognition (Lightweight) - MAIN")
+    print("   👤 /recognizeFace - Face recognition (base64)")
     print("   🚨 /sendAlert - SOS alert")
     print("   🚍 /sendLocation - Update bus location")
+    print("   🗺️ /getRouteHistory/<bus_id> - Get route history")
+    print("   📥 /downloadRouteCSV/<bus_id> - Download route CSV")
     print("   📊 /dashboard - Dashboard data")
+    print("   🔥 /getAnomalies - Get active anomalies")
+    print("   📋 /markAttendance - Mark attendance")
     print("="*60 + "\n")
     app.run(host="0.0.0.0", port=5000, debug=True)
