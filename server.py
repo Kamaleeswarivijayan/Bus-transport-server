@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS sos_alerts (
 )
 """)
 
-# Route history table
+# ROUTE HISTORY TABLE (GPS STORAGE)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS route_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,6 +168,22 @@ delay_records = []
 # ---------------- FACE ATTENDANCE RECORDS ----------------
 
 face_attendance = []
+
+# ---------------- CALCULATE ETA TO STOP ----------------
+def calculate_eta_to_stop(bus_lat, bus_lon, stop_lat, stop_lon, speed):
+    """Calculate estimated time of arrival to a stop"""
+    if speed <= 0:
+        return "Stopped"
+    distance = calculate_distance(bus_lat, bus_lon, stop_lat, stop_lon)
+    eta_minutes = (distance / speed) * 60
+    if eta_minutes < 1:
+        return "Arriving soon"
+    elif eta_minutes < 5:
+        return f"{int(eta_minutes)} min"
+    elif eta_minutes < 15:
+        return f"{int(eta_minutes)} mins"
+    else:
+        return f"{int(eta_minutes)} mins"
 
 # ---------------- ANOMALY DETECTION FUNCTION ----------------
 
@@ -325,7 +341,8 @@ def home():
             "Anomaly detection",
             "Geo-fencing",
             "Voice assistant",
-            "Route history tracking"
+            "Route history tracking",
+            "CSV Download"
         ]
     })
 
@@ -349,6 +366,27 @@ def student_login():
         return jsonify({"status":"error"})
     bus = student.iloc[0]["bus_id"]
     return jsonify({"status":"success","bus_id":bus})
+
+# ---------------- PARENT LOGIN ----------------
+@app.route("/parentLogin", methods=["POST"])
+def parent_login():
+    data = request.json
+    reg_no = data.get("reg_no")
+    
+    if not reg_no:
+        return jsonify({"status": "error", "message": "Register number required"})
+    
+    df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+    student = df[df["reg_no"] == int(reg_no)]
+    
+    if student.empty:
+        return jsonify({"status": "error", "message": "Student not found"})
+    
+    return jsonify({
+        "status": "success",
+        "student_id": reg_no,
+        "student_name": student.iloc[0]["name"]
+    })
 
 # ---------------- GET STUDENTS BY BUS ----------------
 
@@ -442,7 +480,7 @@ def send_location():
     if len(delay_records) > 1000:
         delay_records.pop(0)
 
-    # Save route history
+    # STORE ROUTE HISTORY (GPS DATA)
     try:
         current_time = datetime.now()
         cursor.execute("""
@@ -457,7 +495,7 @@ def send_location():
             current_time.strftime("%Y-%m-%d")
         ))
         conn.commit()
-        print(f"📍 Route saved for {bus_id}: ({latitude}, {longitude})")
+        print(f"📍 Route saved for {bus_id}: ({latitude}, {longitude}) at {current_time.strftime('%H:%M:%S')}")
     except Exception as e:
         print(f"❌ Route save error: {e}")
 
@@ -489,7 +527,7 @@ def get_location(bus_id):
     
     return jsonify({"latitude":0, "longitude":0, "delay":"Unknown"})
 
-# ---------------- GET ROUTE HISTORY ----------------
+# ---------------- ROUTE HISTORY API ----------------
 
 @app.route("/getRouteHistory/<bus_id>")
 def get_route_history(bus_id):
@@ -509,8 +547,7 @@ def get_route_history(bus_id):
                 SELECT latitude, longitude, speed, timestamp
                 FROM route_history
                 WHERE bus_id = ?
-                ORDER BY timestamp DESC
-                LIMIT 500
+                ORDER BY timestamp ASC
             """, (bus_id,))
         
         rows = cursor.fetchall()
@@ -534,7 +571,7 @@ def get_route_history(bus_id):
         print(f"❌ Route history error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ---------------- DOWNLOAD ROUTE CSV ----------------
+# ---------------- DOWNLOAD ROUTE CSV API ----------------
 
 @app.route("/downloadRouteCSV/<bus_id>")
 def download_route_csv(bus_id):
@@ -560,14 +597,16 @@ def download_route_csv(bus_id):
         rows = cursor.fetchall()
         
         if not rows:
-            return jsonify({"error": "No route data found"}), 404
+            return jsonify({"error": "No route data found for this bus"}), 404
         
         filename = f"{bus_id}_route_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         
-        with open(filename, "w", newline="") as file:
-            writer = csv.writer(file)
+        with open(filename, "w", newline="") as f:
+            writer = csv.writer(f)
             writer.writerow(["Latitude", "Longitude", "Speed (km/h)", "Timestamp"])
             writer.writerows(rows)
+        
+        print(f"📥 CSV downloaded: {filename} with {len(rows)} records")
         
         return send_file(filename, as_attachment=True, download_name=filename)
         
@@ -575,7 +614,7 @@ def download_route_csv(bus_id):
         print(f"❌ CSV download error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ---------------- GET ROUTE SUMMARY ----------------
+# ---------------- GET ROUTE SUMMARY API ----------------
 
 @app.route("/getRouteSummary/<bus_id>")
 def get_route_summary(bus_id):
@@ -626,7 +665,7 @@ def get_route_summary(bus_id):
 @app.route("/faceAttendance", methods=["POST"])
 def face_attendance_api():
     """Face recognition attendance using lightweight image comparison"""
-    print("📸 API HIT")  
+    
     if 'image' not in request.files:
         return jsonify({"status": "failed", "message": "No image uploaded"})
 
@@ -755,6 +794,74 @@ def recognize_face():
     except Exception as e:
         print(f"❌ Face recognition error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+# ---------------- PARENT DATA API (FIXED) ----------------
+
+@app.route("/parentData/<student_id>")
+def parent_data(student_id):
+    """Get bus data for parent tracking"""
+    try:
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+        student = df[df["reg_no"] == int(student_id)]
+
+        if student.empty:
+            return jsonify({"error": "Student not found"}), 404
+
+        bus_id = student.iloc[0]["bus_id"]
+        student_name = student.iloc[0]["name"]
+
+        # Get current location
+        if bus_id in bus_locations:
+            location = bus_locations[bus_id]
+        else:
+            location = {"latitude": 0, "longitude": 0}
+
+        # Get speed
+        speed = 0
+        if bus_id in bus_history:
+            speed = bus_history[bus_id].get("speed", 0)
+
+        # Calculate delay
+        distance_to_college = calculate_distance(location["latitude"], location["longitude"], COLLEGE_LAT, COLLEGE_LON)
+        delay = predict_delay(distance_to_college, speed)
+
+        # Get route history (last 50 points)
+        cursor.execute("""
+            SELECT latitude, longitude, speed, timestamp
+            FROM route_history 
+            WHERE bus_id = ? 
+            ORDER BY id DESC 
+            LIMIT 50
+        """, (bus_id,))
+        
+        rows = cursor.fetchall()
+        route = [{"lat": r[0], "lng": r[1], "speed": r[2], "time": r[3]} for r in rows]
+        
+        # Get stops with ETA
+        stops_with_eta = []
+        for stop in BUS_STOPS:
+            eta = calculate_eta_to_stop(location["latitude"], location["longitude"], stop["lat"], stop["lon"], speed)
+            stops_with_eta.append({
+                "name": stop["name"],
+                "lat": stop["lat"],
+                "lon": stop["lon"],
+                "eta": eta
+            })
+        
+        return jsonify({
+            "bus_id": bus_id,
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "speed": round(speed, 2),
+            "delay": delay,
+            "route": route,
+            "stops": stops_with_eta,
+            "student_name": student_name
+        })
+        
+    except Exception as e:
+        print(f"❌ Parent data error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # ---------------- SOS ALERT API ----------------
 
@@ -1021,11 +1128,11 @@ def voice_command():
     elif "bus count" in command or "how many buses" in command:
         return jsonify({"response": f"There are {len(bus_locations)} buses currently active."})
     
-    elif "route" in command or "history" in command:
-        return jsonify({"response": f"Route history available for buses. Use download route feature in admin panel."})
+    elif "route" in command or "history" in command or "csv" in command:
+        return jsonify({"response": f"Route history available. Use download route feature in admin panel to get CSV report."})
     
     else:
-        return jsonify({"response": "Sorry, I didn't understand. Try: bus location, bus status, analytics, anomalies, emergency, or bus count."})
+        return jsonify({"response": "Sorry, I didn't understand. Try: bus location, bus status, analytics, anomalies, emergency, route history, or bus count."})
 
 # ---------------- EMERGENCY ALERT ----------------
 
@@ -1080,41 +1187,7 @@ def download_report():
         for r in rows:
             writer.writerow([r[1],r[2],r[3],r[4]])
     return send_file(filename,as_attachment=True)
-@app.route("/test")
-def test():
-    return "Server Running"
 
-# ---------------- PARENT LOGIN (USING SAME REGISTER NUMBER) ----------------
-@app.route("/parentLogin", methods=["POST"])
-def parent_login():
-    """Parent login using student register number"""
-    try:
-        data = request.json
-        reg_no = data.get("reg_no")
-        
-        if not reg_no:
-            return jsonify({"status": "error", "message": "Register number required"})
-        
-        # Check if student exists in Excel
-        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
-        student = df[df["reg_no"] == int(reg_no)]
-        
-        if student.empty:
-            return jsonify({"status": "error", "message": "Student not found"})
-        
-        bus_id = student.iloc[0]["bus_id"]
-        student_name = student.iloc[0]["name"]
-        
-        return jsonify({
-            "status": "success",
-            "bus_id": bus_id,
-            "student_id": reg_no,
-            "student_name": student_name
-        })
-        
-    except Exception as e:
-        print(f"❌ Parent login error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
 # ---------------- DASHBOARD ----------------
 
 @app.route("/dashboard")
@@ -1163,11 +1236,14 @@ if __name__ == "__main__":
     print(f"🎤 Voice assistant: Ready")
     print(f"🚨 SOS Alerts: Active")
     print(f"🗺️ Route History: Active")
+    print(f"📥 CSV Download: Active")
     print("="*60)
     print("\n✅ Critical Endpoints:")
     print("   📍 /getStudentsByBus/<bus_id> - GET STUDENTS")
     print("   👤 /faceAttendance - Face recognition (Lightweight) - MAIN")
     print("   👤 /recognizeFace - Face recognition (base64)")
+    print("   👨‍👩‍👧 /parentLogin - Parent login")
+    print("   👨‍👩‍👧 /parentData/<student_id> - Parent dashboard data")
     print("   🚨 /sendAlert - SOS alert")
     print("   🚍 /sendLocation - Update bus location")
     print("   🗺️ /getRouteHistory/<bus_id> - Get route history")
