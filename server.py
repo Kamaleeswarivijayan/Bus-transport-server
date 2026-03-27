@@ -18,7 +18,8 @@ EXCEL_FILE = "transport_data.xlsx"
 
 COLLEGE_LAT = 13.013396
 COLLEGE_LON = 79.132097
-GATE_RADIUS = 0.2
+GATE_RADIUS = 0.5  # 500 meters
+OVERSPEED_LIMIT = 60  # km/h
 
 # ---------------- DATABASE ----------------
 
@@ -57,7 +58,8 @@ CREATE TABLE IF NOT EXISTS face_attendance (
     student_id TEXT,
     bus_id TEXT,
     time TEXT,
-    status TEXT
+    status TEXT,
+    date TEXT
 )
 """)
 
@@ -75,7 +77,7 @@ CREATE TABLE IF NOT EXISTS sos_alerts (
 )
 """)
 
-# ROUTE HISTORY TABLE (GPS STORAGE)
+# Route history table
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS route_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +87,46 @@ CREATE TABLE IF NOT EXISTS route_history (
     speed REAL,
     timestamp TEXT,
     date TEXT
+)
+""")
+
+# Emergency alerts table
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS emergency_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_reg TEXT,
+    bus_id TEXT,
+    latitude REAL,
+    longitude REAL,
+    location_name TEXT,
+    timestamp TEXT,
+    status TEXT DEFAULT 'active',
+    acknowledged_by_driver INTEGER DEFAULT 0,
+    acknowledged_by_admin INTEGER DEFAULT 0
+)
+""")
+
+# Attendance table
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS attendance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id TEXT,
+    bus_id TEXT,
+    date TEXT,
+    status TEXT,
+    time TEXT
+)
+""")
+
+# Bus stops table
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bus_stops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bus_id TEXT,
+    stop_name TEXT,
+    latitude REAL,
+    longitude REAL,
+    sequence INTEGER
 )
 """)
 
@@ -131,63 +173,60 @@ def load_known_faces():
 # Load faces on startup
 load_known_faces()
 
-# ---------------- ANOMALY TRACKING ----------------
+# ---------------- GLOBAL VARIABLES ----------------
 
+bus_locations = {}
 bus_history = {}
 bus_anomalies = {}
 anomaly_alerted = {}
-
-# Define route boundaries
-MIN_LAT = 12.9
-MAX_LAT = 13.1
-MIN_LON = 79.0
-MAX_LON = 79.3
-
-OVERSPEED_LIMIT = 80
-STOP_DURATION_THRESHOLD = 300
-
-# ---------------- GEOFENCING ----------------
-
-BUS_STOPS = [
-    {"name": "Main Gate", "lat": 13.013396, "lon": 79.132097},
-    {"name": "Library Stop", "lat": 13.014, "lon": 79.133},
-    {"name": "Hostel Stop", "lat": 13.012, "lon": 79.131},
-]
-
-geo_alerts = []
-
-# ---------------- DRIVER BEHAVIOR ----------------
-
-driver_behavior = {}
-
-# ---------------- ANALYTICS ----------------
-
+bus_boarded = {}
 speed_records = []
 delay_records = []
 
-# ---------------- FACE ATTENDANCE RECORDS ----------------
+# ---------------- HELPER FUNCTIONS ----------------
 
-face_attendance = []
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance between two coordinates in km"""
+    if lat1 == 0 or lon1 == 0 or lat2 == 0 or lon2 == 0:
+        return 999
+    R = 6371
+    dLat = math.radians(lat2 - lat1)
+    dLon = math.radians(lon2 - lon1)
+    a = (math.sin(dLat/2) * math.sin(dLat/2) +
+         math.cos(math.radians(lat1)) *
+         math.cos(math.radians(lat2)) *
+         math.sin(dLon/2) * math.sin(dLon/2))
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
 
-# ---------------- CALCULATE ETA TO STOP ----------------
-def calculate_eta_to_stop(bus_lat, bus_lon, stop_lat, stop_lon, speed):
-    """Calculate estimated time of arrival to a stop"""
-    if speed <= 0:
-        return "Stopped"
-    distance = calculate_distance(bus_lat, bus_lon, stop_lat, stop_lon)
-    eta_minutes = (distance / speed) * 60
-    if eta_minutes < 1:
-        return "Arriving soon"
-    elif eta_minutes < 5:
-        return f"{int(eta_minutes)} min"
-    elif eta_minutes < 15:
-        return f"{int(eta_minutes)} mins"
+def calculate_eta(distance_km, speed_kmh):
+    """Calculate ETA in minutes"""
+    if speed_kmh == 0:
+        return "Unknown"
+    time_hr = distance_km / speed_kmh
+    mins = int(time_hr * 60)
+    if mins < 1:
+        return "< 1 min"
+    elif mins > 60:
+        hours = mins // 60
+        minutes = mins % 60
+        return f"{hours}h {minutes}m"
+    return f"{mins} mins"
+
+def predict_delay(distance_km, speed_kmph):
+    """Predict delay status"""
+    if speed_kmph == 0:
+        return "Bus Stopped"
+    eta = (distance_km / speed_kmph) * 60
+    if eta > 10:
+        return "Delayed"
+    elif eta > 5:
+        return "Slight Delay"
     else:
-        return f"{int(eta_minutes)} mins"
-
-# ---------------- ANOMALY DETECTION FUNCTION ----------------
+        return "On Time"
 
 def detect_anomaly(bus_id, lat, lon, speed):
+    """Detect anomalies like overspeeding, route deviation"""
     anomaly = None
     current_time = datetime.now()
     
@@ -195,19 +234,7 @@ def detect_anomaly(bus_id, lat, lon, speed):
         anomaly = "Overspeeding"
         print(f"⚠️ ANOMALY: Bus {bus_id} is overspeeding at {speed} km/h")
     
-    elif speed == 0:
-        if bus_id in bus_history:
-            last_time = bus_history[bus_id]["time"]
-            last_speed = bus_history[bus_id]["speed"]
-            
-            if last_speed > 0:
-                time_diff = (current_time - last_time).total_seconds()
-                
-                if time_diff > STOP_DURATION_THRESHOLD:
-                    anomaly = "Unexpected Stop"
-                    print(f"⚠️ ANOMALY: Bus {bus_id} has been stopped for {int(time_diff)} seconds")
-    
-    if lat < MIN_LAT or lat > MAX_LAT or lon < MIN_LON or lon > MAX_LON:
+    if lat < 12.9 or lat > 13.1 or lon < 79.0 or lon > 79.3:
         anomaly = "Route Deviation"
         print(f"⚠️ ANOMALY: Bus {bus_id} deviated from route at ({lat}, {lon})")
     
@@ -254,80 +281,29 @@ def detect_anomaly(bus_id, lat, lon, speed):
     
     return anomaly
 
-# ---------------- GEO-FENCING FUNCTION ----------------
-
 def check_geofence(bus_id, lat, lon):
+    """Check if bus is near college or stops"""
     alerts = []
     
     distance_to_college = calculate_distance(lat, lon, COLLEGE_LAT, COLLEGE_LON)
-    
     if distance_to_college < GATE_RADIUS:
-        alerts.append(f"Bus {bus_id} entered college campus")
+        alerts.append(f"Bus {bus_id} is near college campus")
     
-    for stop in BUS_STOPS:
-        dist = calculate_distance(lat, lon, stop["lat"], stop["lon"])
+    try:
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Stops")
+        df['bus_id'] = df['bus_id'].astype(str)
+        stops = df[df["bus_id"] == str(bus_id)]
         
-        if dist < 0.1:
-            alerts.append(f"Bus {bus_id} reached {stop['name']}")
-    
-    for alert in alerts:
-        geo_alerts.append({
-            "bus_id": bus_id,
-            "message": alert,
-            "time": datetime.now().isoformat()
-        })
+        for _, stop in stops.iterrows():
+            dist = calculate_distance(lat, lon, stop["latitude"], stop["longitude"])
+            if dist < 0.3:
+                alerts.append(f"Bus {bus_id} reached {stop['stop_name']}")
+    except Exception as e:
+        print(f"Error checking stops: {e}")
     
     return alerts
 
-# ---------------- DRIVER BEHAVIOR MONITORING ----------------
-
-def monitor_driver_behavior(bus_id, speed):
-    behavior = None
-    
-    if speed > OVERSPEED_LIMIT:
-        behavior = "Overspeeding"
-    
-    if bus_id in driver_behavior:
-        prev_speed = driver_behavior[bus_id]["speed"]
-        speed_diff = abs(speed - prev_speed)
-        
-        if speed_diff > 30:
-            behavior = "Harsh Driving"
-    
-    driver_behavior[bus_id] = {
-        "speed": speed,
-        "time": datetime.now().isoformat()
-    }
-    
-    return behavior
-
-# ---------------- DELAY PREDICTION ----------------
-
-def predict_delay(distance_km, speed_kmph):
-    if speed_kmph == 0:
-        return "Bus Stopped"
-    eta = (distance_km / speed_kmph) * 60
-    if eta > 10:
-        return "Bus Delayed"
-    elif eta > 5:
-        return "Slight Delay"
-    else:
-        return "On Time"
-
-# ---------------- DISTANCE CALCULATION ----------------
-
-def calculate_distance(lat1, lon1, lat2, lon2):
-    R = 6371
-    dLat = math.radians(lat2 - lat1)
-    dLon = math.radians(lon2 - lon1)
-    a = (math.sin(dLat/2) * math.sin(dLat/2) +
-         math.cos(math.radians(lat1)) *
-         math.cos(math.radians(lat2)) *
-         math.sin(dLon/2) * math.sin(dLon/2))
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
-
-# ==================== ROUTES ====================
+# ---------------- ROUTES ----------------
 
 @app.route("/")
 def home():
@@ -336,152 +312,85 @@ def home():
         "message": "College Transport System API",
         "features": [
             "Real-time bus tracking",
-            "Lightweight face recognition attendance",
+            "Face recognition attendance",
             "Emergency alerts",
             "Anomaly detection",
             "Geo-fencing",
             "Voice assistant",
             "Route history tracking",
-            "CSV Download"
+            "ETA calculation"
         ]
     })
 
-# ---------------- GET BUSES ----------------
+@app.route("/test")
+def test():
+    return "Server Running"
+
+# ---------------- BUS MANAGEMENT ----------------
 
 @app.route("/getBuses")
 def get_buses():
-    df = pd.read_excel(EXCEL_FILE, sheet_name="Buses")
-    buses = df["bus_id"].tolist()
-    return jsonify(buses)
-
-# ---------------- STUDENT LOGIN ----------------
-
-@app.route("/studentLogin", methods=["POST"])
-def student_login():
-    data = request.json
-    reg_no = data["reg_no"]
-    df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
-    student = df[df["reg_no"] == int(reg_no)]
-    if student.empty:
-        return jsonify({"status":"error"})
-    bus = student.iloc[0]["bus_id"]
-    return jsonify({"status":"success","bus_id":bus})
-
-# ---------------- PARENT LOGIN ----------------
-@app.route("/parentLogin", methods=["POST"])
-def parent_login():
-    data = request.json
-    reg_no = data.get("reg_no")
-    
-    if not reg_no:
-        return jsonify({"status": "error", "message": "Register number required"})
-    
-    df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
-    student = df[df["reg_no"] == int(reg_no)]
-    
-    if student.empty:
-        return jsonify({"status": "error", "message": "Student not found"})
-    
-    return jsonify({
-        "status": "success",
-        "student_id": reg_no,
-        "student_name": student.iloc[0]["name"]
-    })
-
-# ---------------- GET STUDENTS BY BUS ----------------
-
-@app.route("/getStudentsByBus/<bus_id>")
-def get_students_by_bus(bus_id):
-    """Get all students assigned to a specific bus"""
+    """Get all buses from Excel"""
     try:
-        print(f"📚 Fetching students for bus: {bus_id}")
-        
-        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
-        
-        print(f"📊 Total students in Excel: {len(df)}")
-        print(f"📊 Columns: {df.columns.tolist()}")
-        
-        df['bus_id'] = df['bus_id'].astype(str)
-        
-        students = df[df["bus_id"] == str(bus_id)]
-        
-        print(f"✅ Found {len(students)} students for bus {bus_id}")
-        
-        result = students[["reg_no", "name"]].to_dict(orient="records")
-        
-        if result:
-            print(f"📝 Sample student: {result[0]}")
-        else:
-            print(f"⚠️ No students found for bus {bus_id}")
-            print(f"💡 Available bus IDs in Excel: {df['bus_id'].unique().tolist()}")
-        
-        return jsonify(result)
-        
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Buses")
+        buses = df["bus_id"].astype(str).tolist()
+        print(f"✅ Found buses: {buses}")
+        return jsonify(buses)
     except Exception as e:
-        print(f"❌ Error getting students: {e}")
-        return jsonify({"error": str(e)}), 500
-
-# ---------------- BUS CROWD PREDICTION ----------------
-
-bus_boarded = {}
-
-@app.route("/boardBus", methods=["POST"])
-def board_bus():
-    data = request.json
-    bus = data["bus_id"]
-    if bus not in bus_boarded:
-        bus_boarded[bus] = 0
-    bus_boarded[bus] += 1
-    return {"count": bus_boarded[bus]}
-
-# ---------------- GET BUS STOPS ----------------
+        print(f"Error getting buses: {e}")
+        return jsonify(["BUS001", "BUS002", "BUS003"])
 
 @app.route("/getStops/<bus_id>")
 def get_stops(bus_id):
-    df = pd.read_excel(EXCEL_FILE, sheet_name="Stops")
-    stops = df[df["bus_id"] == bus_id]
-    return jsonify(stops.to_dict(orient="records"))
+    """Get stops for a specific bus from Excel"""
+    try:
+        print(f"📡 Fetching stops for bus: {bus_id}")
+        
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Stops")
+        df['bus_id'] = df['bus_id'].astype(str)
+        bus_id_str = str(bus_id)
+        
+        bus_stops = df[df["bus_id"] == bus_id_str]
+        
+        print(f"📊 Found {len(bus_stops)} stops in Excel for bus {bus_id}")
+        print(f"📊 Available bus IDs in Excel: {df['bus_id'].unique().tolist()}")
+        
+        stops = bus_stops.to_dict(orient="records")
+        
+        if "sequence" in df.columns:
+            stops = sorted(stops, key=lambda x: x.get("sequence", 999))
+        
+        return jsonify(stops)
+        
+    except Exception as e:
+        print(f"❌ Error loading stops: {e}")
+        return jsonify([]), 500
 
-# ---------------- SAVE BUS LOCATION (WITH ROUTE HISTORY) ----------------
-
-bus_locations = {}
+# ---------------- LOCATION TRACKING ----------------
 
 @app.route("/sendLocation", methods=["POST"])
 def send_location():
-    data = request.json
-    bus_id = data["bus_id"]
-    latitude = data["latitude"]
-    longitude = data["longitude"]
-    
-    speed = data.get("speed", 30)
-    
-    if bus_id in bus_locations:
-        prev_lat = bus_locations[bus_id]["latitude"]
-        prev_lng = bus_locations[bus_id]["longitude"]
-        distance = calculate_distance(prev_lat, prev_lng, latitude, longitude)
-        speed = (distance / 5) * 3600
-
-    bus_locations[bus_id] = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "last_update": time.time()
-    }
-
-    anomaly = detect_anomaly(bus_id, latitude, longitude, speed)
-    geo_alerts_list = check_geofence(bus_id, latitude, longitude)
-    behavior = monitor_driver_behavior(bus_id, speed)
-    
-    speed_records.append(speed)
-    if len(speed_records) > 1000:
-        speed_records.pop(0)
-    
-    delay_status = predict_delay(calculate_distance(latitude, longitude, COLLEGE_LAT, COLLEGE_LON), speed)
-    delay_records.append(delay_status)
-    if len(delay_records) > 1000:
-        delay_records.pop(0)
-
-    # STORE ROUTE HISTORY (GPS DATA)
+    """Receive location from driver and save to database"""
     try:
+        data = request.json
+        bus_id = data.get("bus_id")
+        latitude = data.get("latitude", 0)
+        longitude = data.get("longitude", 0)
+        speed = data.get("speed", 0)
+        
+        if bus_id is None:
+            return jsonify({"error": "bus_id required"}), 400
+        
+        bus_locations[bus_id] = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "speed": speed,
+            "last_update": datetime.now().isoformat()
+        }
+        
+        anomaly = detect_anomaly(bus_id, latitude, longitude, speed)
+        geo_alerts = check_geofence(bus_id, latitude, longitude)
+        
         current_time = datetime.now()
         cursor.execute("""
             INSERT INTO route_history (bus_id, latitude, longitude, speed, timestamp, date)
@@ -495,39 +404,489 @@ def send_location():
             current_time.strftime("%Y-%m-%d")
         ))
         conn.commit()
-        print(f"📍 Route saved for {bus_id}: ({latitude}, {longitude}) at {current_time.strftime('%H:%M:%S')}")
+        
+        return jsonify({
+            "status": "ok",
+            "anomaly": anomaly,
+            "geo_alerts": geo_alerts,
+            "speed": round(speed, 2)
+        })
+        
     except Exception as e:
-        print(f"❌ Route save error: {e}")
-
-    return jsonify({
-        "status": "ok",
-        "anomaly": anomaly,
-        "geo_alerts": geo_alerts_list,
-        "behavior": behavior,
-        "speed": round(speed, 2)
-    })
-
-# ---------------- GET LOCATION ----------------
+        print(f"Error sending location: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/getLocation/<bus_id>")
 def get_location(bus_id):
-    if bus_id in bus_locations:
-        lat = bus_locations[bus_id]["latitude"]
-        lng = bus_locations[bus_id]["longitude"]
-        distance = calculate_distance(lat, lng, COLLEGE_LAT, COLLEGE_LON)
-        delay_status = predict_delay(distance, 30)
+    """Get current location of a bus"""
+    try:
+        if bus_id in bus_locations:
+            loc = bus_locations[bus_id]
+            distance = calculate_distance(loc["latitude"], loc["longitude"], COLLEGE_LAT, COLLEGE_LON)
+            delay_status = predict_delay(distance, loc.get("speed", 30))
+            eta = calculate_eta(distance, loc.get("speed", 30))
+            
+            response = {
+                "latitude": loc["latitude"],
+                "longitude": loc["longitude"],
+                "speed": loc.get("speed", 0),
+                "delay": delay_status,
+                "eta": eta,
+                "distance_to_college": round(distance, 2)
+            }
+            
+            if bus_id in bus_anomalies:
+                response["anomaly"] = bus_anomalies[bus_id]["anomaly"]
+                response["anomaly_detected"] = True
+            
+            return jsonify(response)
         
-        response = {"latitude": lat, "longitude": lng, "delay": delay_status}
+        return jsonify({
+            "latitude": 0,
+            "longitude": 0,
+            "speed": 0,
+            "delay": "Unknown",
+            "eta": "Unknown",
+            "distance_to_college": 0
+        })
         
-        if bus_id in bus_anomalies:
-            response["anomaly"] = bus_anomalies[bus_id]["anomaly"]
-            response["anomaly_detected"] = True
+    except Exception as e:
+        print(f"Error getting location: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- STUDENT & PARENT ----------------
+
+@app.route("/studentLogin", methods=["POST"])
+def student_login():
+    try:
+        data = request.json
+        reg_no = data.get("reg_no")
+        
+        if not reg_no:
+            return jsonify({"status": "error", "message": "Register number required"})
+        
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+        df['reg_no'] = df['reg_no'].astype(str)
+        student = df[df["reg_no"] == str(reg_no)]
+        
+        if student.empty:
+            return jsonify({"status": "error", "message": "Student not found"})
+        
+        bus_id = str(student.iloc[0]["bus_id"])
+        return jsonify({"status": "success", "bus_id": bus_id})
+        
+    except Exception as e:
+        print(f"Error in student login: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/parentLogin", methods=["POST"])
+def parent_login():
+    try:
+        data = request.json
+        reg_no = data.get("reg_no")
+        
+        if not reg_no:
+            return jsonify({"status": "error", "message": "Register number required"})
+        
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+        df['reg_no'] = df['reg_no'].astype(str)
+        student = df[df["reg_no"] == str(reg_no)]
+        
+        if student.empty:
+            return jsonify({"status": "error", "message": "Student not found"})
+        
+        bus_id = str(student.iloc[0]["bus_id"])
+        student_name = student.iloc[0]["name"]
+        
+        return jsonify({
+            "status": "success",
+            "bus_id": bus_id,
+            "student_id": reg_no,
+            "student_name": student_name
+        })
+        
+    except Exception as e:
+        print(f"Error in parent login: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/parentData/<student_id>")
+def parent_data(student_id):
+    """Get all data for parent view"""
+    try:
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+        df['reg_no'] = df['reg_no'].astype(str)
+        student = df[df["reg_no"] == str(student_id)]
+        
+        if student.empty:
+            return jsonify({"error": "Student not found"}), 404
+        
+        bus_id = str(student.iloc[0]["bus_id"])
+        student_name = student.iloc[0]["name"]
+        
+        response = {
+            "bus_id": bus_id,
+            "student_name": student_name,
+            "latitude": 0,
+            "longitude": 0,
+            "speed": 0,
+            "delay": "Unknown",
+            "eta": "Unknown",
+            "attendance": "Not Marked",
+            "active_alert": None,
+            "stops": []
+        }
+        
+        if bus_id in bus_locations:
+            loc = bus_locations[bus_id]
+            response["latitude"] = loc["latitude"]
+            response["longitude"] = loc["longitude"]
+            response["speed"] = loc.get("speed", 0)
+            distance = calculate_distance(loc["latitude"], loc["longitude"], COLLEGE_LAT, COLLEGE_LON)
+            response["delay"] = predict_delay(distance, loc.get("speed", 30))
+            response["eta"] = calculate_eta(distance, loc.get("speed", 30))
+        
+        today = datetime.now().strftime("%Y-%m-%d")
+        cursor.execute("""
+            SELECT status, time FROM attendance 
+            WHERE student_id = ? AND date = ?
+            ORDER BY id DESC LIMIT 1
+        """, (student_id, today))
+        
+        row = cursor.fetchone()
+        if row:
+            response["attendance"] = row[0]
+            response["attendance_time"] = row[1]
+            response["attendance_date"] = today
+        
+        cursor.execute("""
+            SELECT * FROM emergency_alerts 
+            WHERE bus_id = ? AND status = 'active'
+            ORDER BY id DESC LIMIT 1
+        """, (bus_id,))
+        
+        row = cursor.fetchone()
+        if row:
+            response["active_alert"] = {
+                "student": row[1],
+                "location": row[5],
+                "time": row[6]
+            }
+        
+        # Get stops from Excel
+        try:
+            stops_df = pd.read_excel(EXCEL_FILE, sheet_name="Stops")
+            stops_df['bus_id'] = stops_df['bus_id'].astype(str)
+            stops = stops_df[stops_df["bus_id"] == bus_id]
+            
+            for _, stop in stops.iterrows():
+                eta = "Unknown"
+                if bus_id in bus_locations:
+                    loc = bus_locations[bus_id]
+                    dist = calculate_distance(loc["latitude"], loc["longitude"], 
+                                              stop["latitude"], stop["longitude"])
+                    eta = calculate_eta(dist, loc.get("speed", 30))
+                
+                response["stops"].append({
+                    "name": stop["stop_name"],
+                    "lat": stop["latitude"],
+                    "lon": stop["longitude"],
+                    "eta": eta
+                })
+        except Exception as e:
+            print(f"Error getting stops: {e}")
         
         return jsonify(response)
-    
-    return jsonify({"latitude":0, "longitude":0, "delay":"Unknown"})
+        
+    except Exception as e:
+        print(f"Error in parent data: {e}")
+        return jsonify({"error": str(e)}), 500
 
-# ---------------- ROUTE HISTORY API ----------------
+# ---------------- STUDENTS BY BUS ----------------
+
+@app.route("/getStudentsByBus/<bus_id>")
+def get_students_by_bus(bus_id):
+    """Get all students assigned to a specific bus"""
+    try:
+        print(f"📚 Fetching students for bus: {bus_id}")
+        
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+        df['bus_id'] = df['bus_id'].astype(str)
+        df['reg_no'] = df['reg_no'].astype(str)
+        
+        students = df[df["bus_id"] == str(bus_id)]
+        
+        print(f"✅ Found {len(students)} students for bus {bus_id}")
+        
+        result = students[["reg_no", "name"]].to_dict(orient="records")
+        
+        if not result:
+            print(f"⚠️ No students found for bus {bus_id}")
+            print(f"💡 Available bus IDs in Excel: {df['bus_id'].unique().tolist()}")
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        print(f"❌ Error getting students: {e}")
+        return jsonify([]), 500
+
+# ---------------- ATTENDANCE ----------------
+
+@app.route("/markAttendance", methods=["POST"])
+def mark_attendance():
+    """Mark attendance for students"""
+    try:
+        data = request.json
+        bus_id = data.get("bus_id")
+        records = data.get("records", [])
+        date = datetime.now().strftime("%Y-%m-%d")
+        current_time = datetime.now().strftime("%H:%M:%S")
+        
+        marked_count = 0
+        
+        for record in records:
+            reg_no = record.get("reg_no")
+            present = record.get("present")
+            
+            if present:
+                cursor.execute("""
+                    INSERT INTO attendance (student_id, bus_id, date, status, time)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (reg_no, bus_id, date, "Present", current_time))
+                marked_count += 1
+                print(f"✅ Marked attendance for {reg_no}")
+        
+        conn.commit()
+        
+        return jsonify({
+            "status": "success", 
+            "message": f"Attendance marked for {marked_count} students",
+            "marked": marked_count
+        })
+        
+    except Exception as e:
+        print(f"Error marking attendance: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/getAttendance/<bus_id>")
+def get_attendance(bus_id):
+    """Get attendance records for a bus on a specific date"""
+    try:
+        date_filter = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+        
+        cursor.execute("""
+            SELECT student_id, status, time
+            FROM attendance
+            WHERE bus_id = ? AND date = ?
+            ORDER BY id DESC
+        """, (bus_id, date_filter))
+        
+        rows = cursor.fetchall()
+        
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+        df['bus_id'] = df['bus_id'].astype(str)
+        df['reg_no'] = df['reg_no'].astype(str)
+        bus_students = df[df["bus_id"] == str(bus_id)]
+        
+        records = []
+        for row in rows:
+            student = bus_students[bus_students["reg_no"] == row[0]]
+            name = student.iloc[0]["name"] if not student.empty else row[0]
+            
+            records.append({
+                "reg_no": row[0],
+                "name": name,
+                "present": row[1] == "Present",
+                "time": row[2]
+            })
+        
+        return jsonify({"records": records})
+        
+    except Exception as e:
+        print(f"Error getting attendance: {e}")
+        return jsonify({"records": []}), 500
+
+# ---------------- EMERGENCY ALERTS ----------------
+
+@app.route("/sendEmergency", methods=["POST"])
+def send_emergency():
+    """Send emergency alert from student"""
+    try:
+        data = request.json
+        
+        student_reg = data.get("student_reg")
+        bus_id = data.get("bus_id")
+        latitude = data.get("latitude", 0)
+        longitude = data.get("longitude", 0)
+        location_name = data.get("location_name", "Unknown")
+        
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        print("\n" + "="*50)
+        print("🚨 EMERGENCY ALERT!")
+        print("="*50)
+        print(f"   👤 Student: {student_reg}")
+        print(f"   🚍 Bus: {bus_id}")
+        print(f"   📍 Location: {location_name}")
+        print(f"   ⏰ Time: {current_time}")
+        print("="*50 + "\n")
+        
+        cursor.execute("""
+            INSERT INTO emergency_alerts 
+            (student_reg, bus_id, latitude, longitude, location_name, timestamp, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (student_reg, bus_id, latitude, longitude, location_name, current_time, "active"))
+        conn.commit()
+        
+        return jsonify({
+            "status": "success",
+            "message": "Emergency alert sent to driver and admin",
+            "alert_id": cursor.lastrowid
+        })
+        
+    except Exception as e:
+        print(f"Error sending emergency: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/getDriverAlerts/<bus_id>")
+def get_driver_alerts(bus_id):
+    """Get active alerts for a specific bus (driver view)"""
+    try:
+        cursor.execute("""
+            SELECT * FROM emergency_alerts 
+            WHERE bus_id = ? AND status = 'active'
+            ORDER BY timestamp DESC
+        """, (bus_id,))
+        
+        rows = cursor.fetchall()
+        alerts = []
+        
+        for row in rows:
+            alerts.append({
+                "id": row[0],
+                "student_reg": row[1],
+                "bus_id": row[2],
+                "latitude": row[3],
+                "longitude": row[4],
+                "location_name": row[5],
+                "alert_time": row[6],
+                "driver_acknowledged": row[8] == 1
+            })
+        
+        return jsonify({"alerts": alerts})
+        
+    except Exception as e:
+        print(f"Error getting driver alerts: {e}")
+        return jsonify({"alerts": []}), 500
+
+@app.route("/getAdminAlerts")
+def get_admin_alerts():
+    """Get all active alerts (admin view)"""
+    try:
+        cursor.execute("""
+            SELECT * FROM emergency_alerts 
+            WHERE status = 'active'
+            ORDER BY timestamp DESC
+        """)
+        
+        rows = cursor.fetchall()
+        alerts = []
+        
+        for row in rows:
+            alerts.append({
+                "id": row[0],
+                "student_reg": row[1],
+                "bus_id": row[2],
+                "latitude": row[3],
+                "longitude": row[4],
+                "location_name": row[5],
+                "alert_time": row[6],
+                "admin_acknowledged": row[9] == 1
+            })
+        
+        return jsonify({"alerts": alerts})
+        
+    except Exception as e:
+        print(f"Error getting admin alerts: {e}")
+        return jsonify({"alerts": []}), 500
+
+@app.route("/getAlertHistory")
+def get_alert_history():
+    """Get resolved alerts history"""
+    try:
+        cursor.execute("""
+            SELECT * FROM emergency_alerts 
+            WHERE status = 'resolved'
+            ORDER BY timestamp DESC
+            LIMIT 50
+        """)
+        
+        rows = cursor.fetchall()
+        alerts = []
+        
+        for row in rows:
+            alerts.append({
+                "id": row[0],
+                "student_reg": row[1],
+                "bus_id": row[2],
+                "location_name": row[5],
+                "alert_time": row[6]
+            })
+        
+        return jsonify({"alerts": alerts})
+        
+    except Exception as e:
+        print(f"Error getting alert history: {e}")
+        return jsonify({"alerts": []}), 500
+
+@app.route("/acknowledgeAlert", methods=["POST"])
+def acknowledge_alert():
+    """Acknowledge an emergency alert"""
+    try:
+        data = request.json
+        alert_id = data.get("alert_id")
+        user_type = data.get("user_type")
+        
+        if user_type == "driver":
+            cursor.execute("""
+                UPDATE emergency_alerts 
+                SET acknowledged_by_driver = 1 
+                WHERE id = ?
+            """, (alert_id,))
+        elif user_type == "admin":
+            cursor.execute("""
+                UPDATE emergency_alerts 
+                SET acknowledged_by_admin = 1 
+                WHERE id = ?
+            """, (alert_id,))
+        
+        conn.commit()
+        return jsonify({"status": "success"})
+        
+    except Exception as e:
+        print(f"Error acknowledging alert: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/resolveAlert", methods=["POST"])
+def resolve_alert():
+    """Resolve an emergency alert"""
+    try:
+        data = request.json
+        alert_id = data.get("alert_id")
+        
+        cursor.execute("""
+            UPDATE emergency_alerts 
+            SET status = 'resolved' 
+            WHERE id = ?
+        """, (alert_id,))
+        conn.commit()
+        
+        return jsonify({"status": "success"})
+        
+    except Exception as e:
+        print(f"Error resolving alert: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- ROUTE HISTORY ----------------
 
 @app.route("/getRouteHistory/<bus_id>")
 def get_route_history(bus_id):
@@ -547,11 +906,11 @@ def get_route_history(bus_id):
                 SELECT latitude, longitude, speed, timestamp
                 FROM route_history
                 WHERE bus_id = ?
-                ORDER BY timestamp ASC
+                ORDER BY timestamp DESC
+                LIMIT 500
             """, (bus_id,))
         
         rows = cursor.fetchall()
-        
         data = []
         for row in rows:
             data.append({
@@ -571,13 +930,55 @@ def get_route_history(bus_id):
         print(f"❌ Route history error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ---------------- DOWNLOAD ROUTE CSV API ----------------
-
-@app.route("/downloadRouteCSV/<bus_id>")
-def download_route_csv(bus_id):
-    """Download route history as CSV file"""
+@app.route("/getRoutes/<bus_id>")
+def get_routes(bus_id):
+    """Get routes grouped by date"""
     try:
-        date_filter = request.args.get("date", None)
+        date_filter = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+        
+        cursor.execute("""
+            SELECT 
+                MIN(timestamp) as start_time,
+                MAX(timestamp) as end_time,
+                COUNT(*) as point_count,
+                AVG(speed) as avg_speed,
+                MAX(speed) as max_speed
+            FROM route_history
+            WHERE bus_id = ? AND date = ?
+        """, (bus_id, date_filter))
+        
+        row = cursor.fetchone()
+        
+        routes = []
+        if row and row[0]:
+            routes.append({
+                "id": f"{bus_id}_{date_filter}",
+                "start_time": row[0],
+                "end_time": row[1],
+                "point_count": row[2],
+                "avg_speed": round(row[3], 2) if row[3] else 0,
+                "max_speed": round(row[4], 2) if row[4] else 0
+            })
+        
+        return jsonify({"routes": routes})
+        
+    except Exception as e:
+        print(f"❌ Get routes error: {e}")
+        return jsonify({"routes": []}), 500
+
+@app.route("/downloadRoute/<route_id>")
+def download_route(route_id):
+    """Download route as CSV or GeoJSON"""
+    try:
+        format = request.args.get("format", "csv")
+        
+        parts = route_id.split("_")
+        if len(parts) >= 2:
+            bus_id = parts[0]
+            date_filter = parts[1]
+        else:
+            bus_id = route_id
+            date_filter = None
         
         if date_filter:
             cursor.execute("""
@@ -597,129 +998,338 @@ def download_route_csv(bus_id):
         rows = cursor.fetchall()
         
         if not rows:
-            return jsonify({"error": "No route data found for this bus"}), 404
+            return jsonify({"error": "No route data found"}), 404
         
-        filename = f"{bus_id}_route_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        filename = f"{bus_id}_route_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        with open(filename, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Latitude", "Longitude", "Speed (km/h)", "Timestamp"])
-            writer.writerows(rows)
-        
-        print(f"📥 CSV downloaded: {filename} with {len(rows)} records")
+        if format == "csv":
+            filename += ".csv"
+            with open(filename, "w", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Latitude", "Longitude", "Speed (km/h)", "Timestamp"])
+                writer.writerows(rows)
+        elif format == "geojson":
+            filename += ".geojson"
+            features = []
+            for row in rows:
+                features.append({
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [row[1], row[0]]
+                    },
+                    "properties": {
+                        "speed": row[2],
+                        "timestamp": row[3]
+                    }
+                })
+            
+            geojson = {
+                "type": "FeatureCollection",
+                "features": features
+            }
+            
+            import json
+            with open(filename, "w") as file:
+                json.dump(geojson, file)
         
         return send_file(filename, as_attachment=True, download_name=filename)
         
     except Exception as e:
-        print(f"❌ CSV download error: {e}")
+        print(f"❌ Download route error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ---------------- GET ROUTE SUMMARY API ----------------
+# ---------------- BUS LOGS ----------------
 
-@app.route("/getRouteSummary/<bus_id>")
-def get_route_summary(bus_id):
-    """Get summary statistics for route"""
+@app.route("/getLogs")
+def get_logs():
+    """Get bus logs"""
     try:
-        date_filter = request.args.get("date", None)
+        cursor.execute("SELECT * FROM bus_log ORDER BY id DESC LIMIT 100")
+        rows = cursor.fetchall()
+        logs = []
+        for r in rows:
+            logs.append({
+                "id": r[0],
+                "bus_id": r[1],
+                "entry_time": r[2] if r[2] else "Not logged",
+                "exit_time": r[3] if r[3] else "Not logged",
+                "arrival_time": r[4] if r[4] else "Not logged"
+            })
+        return jsonify(logs)
+    except Exception as e:
+        print(f"Error getting logs: {e}")
+        return jsonify([])
+
+@app.route("/logBus", methods=["POST"])
+def log_bus():
+    """Log bus entry/exit"""
+    try:
+        data = request.json
+        bus_id = data.get("bus_id")
+        entry = data.get("entry_time")
+        exit_time = data.get("exit_time")
+        arrival = data.get("arrival_time")
         
-        if date_filter:
-            cursor.execute("""
-                SELECT COUNT(*) as point_count,
-                       MIN(timestamp) as start_time,
-                       MAX(timestamp) as end_time,
-                       AVG(speed) as avg_speed,
-                       MAX(speed) as max_speed
-                FROM route_history
-                WHERE bus_id = ? AND date = ?
-            """, (bus_id, date_filter))
-        else:
-            cursor.execute("""
-                SELECT COUNT(*) as point_count,
-                       MIN(timestamp) as start_time,
-                       MAX(timestamp) as end_time,
-                       AVG(speed) as avg_speed,
-                       MAX(speed) as max_speed
-                FROM route_history
-                WHERE bus_id = ?
-                ORDER BY timestamp DESC
-                LIMIT 1000
-            """, (bus_id,))
+        cursor.execute("""
+            INSERT INTO bus_log(bus_id, entry_time, exit_time, arrival_time)
+            VALUES(?,?,?,?)
+        """, (bus_id, entry, exit_time, arrival))
+        conn.commit()
         
-        row = cursor.fetchone()
+        return jsonify({"status": "saved"})
+        
+    except Exception as e:
+        print(f"Error logging bus: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- DASHBOARD ----------------
+
+@app.route("/dashboard")
+def dashboard():
+    """Get dashboard data for admin"""
+    try:
+        active_buses = len(bus_locations)
+        
+        delayed = 0
+        for bus_id, data in bus_locations.items():
+            if data.get("speed", 0) < 10:
+                delayed += 1
+        
+        try:
+            df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+            total_students = len(df)
+        except:
+            total_students = 0
+        
+        cursor.execute("SELECT COUNT(*) FROM emergency_alerts WHERE status = 'active'")
+        emergency_count = cursor.fetchone()[0]
         
         return jsonify({
-            "bus_id": bus_id,
-            "point_count": row[0] if row else 0,
-            "start_time": row[1] if row else None,
-            "end_time": row[2] if row else None,
-            "average_speed": round(row[3], 2) if row and row[3] else 0,
-            "max_speed": round(row[4], 2) if row and row[4] else 0
+            "active_buses": active_buses,
+            "delayed_buses": delayed,
+            "students": total_students,
+            "emergency": emergency_count
         })
         
     except Exception as e:
-        print(f"❌ Route summary error: {e}")
+        print(f"Error getting dashboard: {e}")
+        return jsonify({
+            "active_buses": 0,
+            "delayed_buses": 0,
+            "students": 0,
+            "emergency": 0
+        })
+
+@app.route("/busSummary/<bus_id>")
+def bus_summary(bus_id):
+    """Get summary for a specific bus"""
+    try:
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+        df['bus_id'] = df['bus_id'].astype(str)
+        students_on_bus = len(df[df["bus_id"] == str(bus_id)])
+        
+        today = datetime.now().strftime("%Y-%m-%d")
+        cursor.execute("""
+            SELECT COUNT(*) FROM attendance 
+            WHERE bus_id = ? AND date = ? AND status = 'Present'
+        """, (bus_id, today))
+        present_count = cursor.fetchone()[0]
+        
+        location = None
+        if bus_id in bus_locations:
+            loc = bus_locations[bus_id]
+            location = {
+                "lat": loc["latitude"],
+                "lng": loc["longitude"],
+                "speed": loc.get("speed", 0)
+            }
+        
+        return jsonify({
+            "bus_id": bus_id,
+            "total_students": students_on_bus,
+            "present_today": present_count,
+            "location": location,
+            "status": "active" if bus_id in bus_locations else "inactive"
+        })
+        
+    except Exception as e:
+        print(f"Error in bus summary: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ---------------- FACE ATTENDANCE API (LIGHTWEIGHT) ----------------
+@app.route("/downloadReport")
+def download_report():
+    """Download full report"""
+    try:
+        cursor.execute("SELECT * FROM bus_log")
+        rows = cursor.fetchall()
+        
+        filename = "bus_report.csv"
+        with open(filename, "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["ID", "Bus ID", "Entry Time", "Exit Time", "Arrival Time"])
+            writer.writerows(rows)
+        
+        return send_file(filename, as_attachment=True)
+        
+    except Exception as e:
+        print(f"Error downloading report: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- ANOMALIES ----------------
+
+@app.route("/getAnomalies")
+def get_anomalies():
+    """Get active anomalies"""
+    anomalies_list = []
+    for bus_id, anomaly_data in bus_anomalies.items():
+        anomalies_list.append({
+            "bus_id": bus_id,
+            "anomaly_type": anomaly_data["anomaly"],
+            "latitude": anomaly_data["lat"],
+            "longitude": anomaly_data["lon"],
+            "speed": anomaly_data["speed"],
+            "timestamp": anomaly_data["time"]
+        })
+    return jsonify({"anomalies": anomalies_list, "count": len(anomalies_list)})
+
+@app.route("/getAnomalyHistory")
+def get_anomaly_history():
+    """Get anomaly history"""
+    try:
+        cursor.execute("""
+            SELECT * FROM anomaly_logs 
+            ORDER BY timestamp DESC 
+            LIMIT 100
+        """)
+        
+        rows = cursor.fetchall()
+        history = []
+        
+        for row in rows:
+            history.append({
+                "id": row[0],
+                "bus_id": row[1],
+                "anomaly_type": row[2],
+                "latitude": row[3],
+                "longitude": row[4],
+                "speed": row[5],
+                "timestamp": row[6],
+                "status": row[7]
+            })
+        
+        return jsonify({"history": history, "count": len(history)})
+        
+    except Exception as e:
+        print(f"Error getting anomaly history: {e}")
+        return jsonify({"history": []}), 500
+
+@app.route("/resolveAnomaly", methods=["POST"])
+def resolve_anomaly():
+    """Resolve an anomaly"""
+    try:
+        data = request.json
+        bus_id = data.get("bus_id")
+        
+        if bus_id in bus_anomalies:
+            del bus_anomalies[bus_id]
+            
+            cursor.execute("""
+                UPDATE anomaly_logs 
+                SET status = 'resolved' 
+                WHERE bus_id = ? AND status = 'active'
+            """, (bus_id,))
+            conn.commit()
+            
+            return jsonify({"status": "success", "message": f"Anomaly resolved for bus {bus_id}"})
+        
+        return jsonify({"status": "error", "message": "No active anomaly found"})
+        
+    except Exception as e:
+        print(f"Error resolving anomaly: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/reroute", methods=["POST"])
+def reroute_bus():
+    """Reroute a broken bus to a replacement bus"""
+    try:
+        data = request.json
+        old_bus = data.get("old_bus")
+        new_bus = data.get("new_bus")
+        reason = data.get("reason", "Admin reroute")
+        
+        print(f"\n🚌 REROUTE: {old_bus} -> {new_bus}")
+        print(f"   Reason: {reason}")
+        
+        try:
+            df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
+            df['bus_id'] = df['bus_id'].astype(str)
+            df.loc[df["bus_id"] == old_bus, "bus_id"] = new_bus
+            df.to_excel(EXCEL_FILE, sheet_name="Students", index=False)
+            print(f"   ✅ Updated {len(df[df['bus_id'] == new_bus])} students")
+        except Exception as e:
+            print(f"   ⚠️ Could not update Excel: {e}")
+        
+        return jsonify({"status": "success", "message": f"Rerouted {old_bus} to {new_bus}"})
+        
+    except Exception as e:
+        print(f"Error rerouting bus: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- FACE ATTENDANCE ----------------
 
 @app.route("/faceAttendance", methods=["POST"])
 def face_attendance_api():
     """Face recognition attendance using lightweight image comparison"""
+    print("📸 API HIT - Face Attendance")
     
     if 'image' not in request.files:
         return jsonify({"status": "failed", "message": "No image uploaded"})
-
+    
     file = request.files['image']
     bus_id = request.form.get("bus_id", "Unknown")
-
+    
     try:
-        # Convert image bytes to numpy array
         file_bytes = np.frombuffer(file.read(), np.uint8)
         img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
+        
         if img is None:
             return jsonify({"status": "failed", "message": "Invalid image format"})
-
-        # Convert to grayscale for comparison
+        
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
         if not known_faces:
             return jsonify({"status": "failed", "message": "No student faces loaded. Add images to faces/ folder"})
-
-        # Compare with known faces using Mean Squared Error
+        
         best_match = None
         best_score = float('inf')
         
         for student_id, known_img in known_faces.items():
-            # Resize to match known image dimensions
             resized = cv2.resize(gray, (known_img.shape[1], known_img.shape[0]))
-            
-            # Calculate Mean Squared Error (lower is better)
             diff = np.mean((resized.astype(float) - known_img.astype(float)) ** 2)
             
             if diff < best_score:
                 best_score = diff
                 best_match = student_id
         
-        # Threshold for face recognition (adjust if needed)
         if best_score < 2000:
-            current_time = datetime.now().isoformat()
+            current_time = datetime.now()
+            date_str = current_time.strftime("%Y-%m-%d")
+            time_str = current_time.strftime("%H:%M:%S")
             
-            # Save attendance
             cursor.execute("""
-                INSERT INTO face_attendance (student_id, bus_id, time, status)
-                VALUES (?, ?, ?, ?)
-            """, (best_match, bus_id, current_time, "Present"))
+                INSERT INTO attendance (student_id, bus_id, date, status, time)
+                VALUES (?, ?, ?, ?, ?)
+            """, (best_match, bus_id, date_str, "Present", time_str))
             conn.commit()
             
-            face_attendance.append({
-                "student_id": best_match,
-                "bus_id": bus_id,
-                "time": current_time,
-                "status": "Present"
-            })
+            cursor.execute("""
+                INSERT INTO face_attendance (student_id, bus_id, time, status, date)
+                VALUES (?, ?, ?, ?, ?)
+            """, (best_match, bus_id, current_time.isoformat(), "Present", date_str))
+            conn.commit()
             
-            print(f"✅ Attendance marked for {best_match} (score: {best_score:.2f})")
+            print(f"✅ Face attendance marked for {best_match} (score: {best_score:.2f})")
             
             return jsonify({
                 "status": "success",
@@ -727,7 +1337,7 @@ def face_attendance_api():
                 "data": {
                     "student_id": best_match,
                     "bus_id": bus_id,
-                    "time": current_time
+                    "time": current_time.isoformat()
                 }
             })
         else:
@@ -735,17 +1345,14 @@ def face_attendance_api():
                 "status": "failed",
                 "message": f"Face not recognized (score: {best_score:.2f})"
             })
-
+            
     except Exception as e:
         print(f"❌ Face attendance error: {e}")
         return jsonify({"status": "error", "message": f"Error: {str(e)}"})
 
-# ---------------- FACE RECOGNITION API (Base64 - Compatibility) ----------------
-
 @app.route("/recognizeFace", methods=["POST"])
 def recognize_face():
     """Recognize face from base64 image (compatibility)"""
-    
     try:
         data = request.json
         image_data = data.get("image", "")
@@ -753,20 +1360,17 @@ def recognize_face():
         if not image_data:
             return jsonify({"status": "error", "message": "No image data"})
         
-        # Decode base64 image
         image_bytes = base64.b64decode(image_data)
         img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
         
         if img is None:
             return jsonify({"status": "error", "message": "Invalid image format"})
         
-        # Convert to grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
         if not known_faces:
-            return jsonify({"status": "error", "message": "No registered faces found. Add images to faces/ folder"})
+            return jsonify({"status": "error", "message": "No registered faces found"})
         
-        # Compare with known faces
         best_match = None
         best_score = float('inf')
         
@@ -795,255 +1399,80 @@ def recognize_face():
         print(f"❌ Face recognition error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ---------------- PARENT DATA API (FIXED) ----------------
+# ---------------- VOICE ASSISTANT ----------------
 
-@app.route("/parentData/<student_id>")
-def parent_data(student_id):
-    """Get bus data for parent tracking"""
+@app.route("/voiceCommand", methods=["POST"])
+def voice_command():
+    """Handle voice commands"""
     try:
-        df = pd.read_excel(EXCEL_FILE, sheet_name="Students")
-        student = df[df["reg_no"] == int(student_id)]
-
-        if student.empty:
-            return jsonify({"error": "Student not found"}), 404
-
-        bus_id = student.iloc[0]["bus_id"]
-        student_name = student.iloc[0]["name"]
-
-        # Get current location
-        if bus_id in bus_locations:
-            location = bus_locations[bus_id]
+        data = request.json
+        command = data.get("command", "").lower()
+        bus_id = data.get("bus_id")
+        
+        if "location" in command or "where" in command:
+            if bus_id and bus_id in bus_locations:
+                loc = bus_locations[bus_id]
+                return jsonify({"response": f"Bus {bus_id} is at {loc['latitude']:.4f}, {loc['longitude']:.4f}"})
+            else:
+                return jsonify({"response": "Bus location not available"})
+        
+        elif "emergency" in command or "help" in command:
+            return jsonify({"response": f"Emergency alert sent for bus {bus_id}"})
+        
+        elif "status" in command:
+            if bus_id and bus_id in bus_locations:
+                if bus_id in bus_anomalies:
+                    return jsonify({"response": f"Bus {bus_id} has anomaly: {bus_anomalies[bus_id]['anomaly']}"})
+                else:
+                    return jsonify({"response": f"Bus {bus_id} is running normally"})
+            else:
+                return jsonify({"response": "Bus status unknown"})
+        
+        elif "average" in command or "speed" in command:
+            avg_speed = sum(speed_records) / len(speed_records) if speed_records else 0
+            return jsonify({"response": f"Average bus speed is {round(avg_speed, 2)} km/h"})
+        
+        elif "anomaly" in command:
+            if bus_anomalies:
+                return jsonify({"response": f"There are {len(bus_anomalies)} active anomalies"})
+            else:
+                return jsonify({"response": "No active anomalies detected"})
+        
+        elif "bus count" in command or "how many buses" in command:
+            return jsonify({"response": f"There are {len(bus_locations)} buses currently active"})
+        
         else:
-            location = {"latitude": 0, "longitude": 0}
-
-        # Get speed
-        speed = 0
-        if bus_id in bus_history:
-            speed = bus_history[bus_id].get("speed", 0)
-
-        # Calculate delay
-        distance_to_college = calculate_distance(location["latitude"], location["longitude"], COLLEGE_LAT, COLLEGE_LON)
-        delay = predict_delay(distance_to_college, speed)
-
-        # Get route history (last 50 points)
-        cursor.execute("""
-            SELECT latitude, longitude, speed, timestamp
-            FROM route_history 
-            WHERE bus_id = ? 
-            ORDER BY id DESC 
-            LIMIT 50
-        """, (bus_id,))
-        
-        rows = cursor.fetchall()
-        route = [{"lat": r[0], "lng": r[1], "speed": r[2], "time": r[3]} for r in rows]
-        
-        # Get stops with ETA
-        stops_with_eta = []
-        for stop in BUS_STOPS:
-            eta = calculate_eta_to_stop(location["latitude"], location["longitude"], stop["lat"], stop["lon"], speed)
-            stops_with_eta.append({
-                "name": stop["name"],
-                "lat": stop["lat"],
-                "lon": stop["lon"],
-                "eta": eta
-            })
-        
-        return jsonify({
-            "bus_id": bus_id,
-            "latitude": location["latitude"],
-            "longitude": location["longitude"],
-            "speed": round(speed, 2),
-            "delay": delay,
-            "route": route,
-            "stops": stops_with_eta,
-            "student_name": student_name
-        })
+            return jsonify({"response": "I didn't understand. Try: bus location, bus status, average speed, anomalies, emergency, or bus count"})
         
     except Exception as e:
-        print(f"❌ Parent data error: {e}")
-        return jsonify({"error": str(e)}), 500
+        print(f"Error processing voice command: {e}")
+        return jsonify({"response": "Sorry, there was an error processing your command"}), 500
 
-# ---------------- SOS ALERT API ----------------
+# ---------------- LEGACY ENDPOINTS ----------------
 
-@app.route("/sendAlert", methods=["POST"])
-def send_alert():
-    """Receive SOS alert from student"""
+@app.route("/boardBus", methods=["POST"])
+def board_bus():
     try:
         data = request.json
-        
-        student_id = data.get("student_id", "Unknown")
-        bus_id = data.get("bus_id", "Unknown")
-        latitude = data.get("latitude", 0)
-        longitude = data.get("longitude", 0)
-        location_name = data.get("location_name", "Unknown")
-        
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        print("\n" + "="*50)
-        print("🚨 SOS ALERT RECEIVED!")
-        print("="*50)
-        print(f"   👤 Student: {student_id}")
-        print(f"   🚍 Bus: {bus_id}")
-        print(f"   📍 Location: {location_name}")
-        print(f"   🗺️ Coordinates: {latitude}, {longitude}")
-        print(f"   ⏰ Time: {current_time}")
-        print("="*50 + "\n")
-        
-        cursor.execute("""
-            INSERT INTO sos_alerts (student_id, bus_id, latitude, longitude, location_name, timestamp, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (student_id, bus_id, latitude, longitude, location_name, current_time, "active"))
-        conn.commit()
-        
-        return jsonify({
-            "status": "success",
-            "message": "🚨 SOS Alert received! Driver and Admin notified.",
-            "alert_id": cursor.lastrowid
-        })
-        
+        bus = data.get("bus_id")
+        if bus not in bus_boarded:
+            bus_boarded[bus] = 0
+        bus_boarded[bus] += 1
+        return jsonify({"count": bus_boarded[bus]})
     except Exception as e:
-        print(f"❌ SOS alert error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"Error boarding bus: {e}")
+        return jsonify({"count": 0})
 
-# ---------------- GET ACTIVE SOS ALERTS ----------------
-
-@app.route("/getSOSAlerts")
-def get_sos_alerts():
-    try:
-        cursor.execute("""
-            SELECT * FROM sos_alerts 
-            WHERE status = 'active'
-            ORDER BY timestamp DESC
-        """)
-        
-        rows = cursor.fetchall()
-        alerts = []
-        
-        for row in rows:
-            alerts.append({
-                "id": row[0],
-                "student_id": row[1],
-                "bus_id": row[2],
-                "latitude": row[3],
-                "longitude": row[4],
-                "location_name": row[5],
-                "timestamp": row[6],
-                "status": row[7]
-            })
-        
-        return jsonify({"alerts": alerts, "count": len(alerts)})
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---------------- RESOLVE SOS ALERT ----------------
-
-@app.route("/resolveSOSAlert", methods=["POST"])
-def resolve_sos_alert():
-    try:
-        data = request.json
-        alert_id = data["alert_id"]
-        
-        cursor.execute("""
-            UPDATE sos_alerts 
-            SET status = 'resolved' 
-            WHERE id = ?
-        """, (alert_id,))
-        conn.commit()
-        
-        return jsonify({"status": "success", "message": f"Alert {alert_id} resolved"})
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---------------- GET ALL ANOMALIES ----------------
-
-@app.route("/getAnomalies")
-def get_anomalies():
-    anomalies_list = []
-    for bus_id, anomaly_data in bus_anomalies.items():
-        anomalies_list.append({
-            "bus_id": bus_id,
-            "anomaly_type": anomaly_data["anomaly"],
-            "latitude": anomaly_data["lat"],
-            "longitude": anomaly_data["lon"],
-            "speed": anomaly_data["speed"],
-            "timestamp": anomaly_data["time"]
-        })
-    return jsonify({"anomalies": anomalies_list, "count": len(anomalies_list)})
-
-# ---------------- GET ANOMALY HISTORY ----------------
-
-@app.route("/getAnomalyHistory")
-def get_anomaly_history():
-    try:
-        cursor.execute("""
-            SELECT * FROM anomaly_logs 
-            ORDER BY timestamp DESC 
-            LIMIT 100
-        """)
-        
-        rows = cursor.fetchall()
-        history = []
-        
-        for row in rows:
-            history.append({
-                "id": row[0],
-                "bus_id": row[1],
-                "anomaly_type": row[2],
-                "latitude": row[3],
-                "longitude": row[4],
-                "speed": row[5],
-                "timestamp": row[6],
-                "status": row[7]
-            })
-        
-        return jsonify({"history": history, "count": len(history)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# ---------------- RESOLVE ANOMALY ----------------
-
-@app.route("/resolveAnomaly", methods=["POST"])
-def resolve_anomaly():
+@app.route("/emergency", methods=["POST"])
+def emergency():
     data = request.json
-    bus_id = data["bus_id"]
-    
-    if bus_id in bus_anomalies:
-        del bus_anomalies[bus_id]
-        
-        try:
-            cursor.execute("""
-                UPDATE anomaly_logs 
-                SET status = 'resolved' 
-                WHERE bus_id = ? AND status = 'active'
-            """, (bus_id,))
-            conn.commit()
-        except Exception as e:
-            print(f"Error updating anomaly: {e}")
-        
-        return jsonify({"status": "success", "message": f"Anomaly resolved for bus {bus_id}"})
-    
-    return jsonify({"status": "error", "message": "No active anomaly found for this bus"})
-
-# ---------------- GET GEO-FENCING ALERTS ----------------
-
-@app.route("/getGeoAlerts")
-def get_geo_alerts():
-    return jsonify(geo_alerts)
-
-# ---------------- GET DRIVER BEHAVIOR ----------------
-
-@app.route("/getDriverBehavior")
-def get_driver_behavior():
-    return jsonify(driver_behavior)
-
-# ---------------- ANALYTICS API ----------------
+    print(f"Emergency from bus: {data.get('bus_id')}")
+    return jsonify({"status": "alert sent"})
 
 @app.route("/analytics")
 def analytics():
     avg_speed = sum(speed_records) / len(speed_records) if speed_records else 0
-    delay_count = delay_records.count("Bus Delayed") + delay_records.count("Slight Delay")
+    delay_count = delay_records.count("Delayed") + delay_records.count("Slight Delay")
     total = len(delay_records) if delay_records else 1
     delay_rate = (delay_count / total) * 100
     
@@ -1055,171 +1484,22 @@ def analytics():
         "anomaly_count": len(bus_anomalies)
     })
 
-# ---------------- MARK ATTENDANCE API ----------------
+# ---------------- DEBUG ENDPOINT ----------------
 
-@app.route("/markAttendance", methods=["POST"])
-def mark_attendance():
+@app.route("/debugStops")
+def debug_stops():
+    """Debug endpoint to check Excel stops data"""
     try:
-        data = request.json
-        bus_id = data.get("bus_id")
-        records = data.get("records", [])
+        df = pd.read_excel(EXCEL_FILE, sheet_name="Stops")
         
-        current_time = datetime.now().isoformat()
-        
-        for record in records:
-            reg_no = record.get("reg_no")
-            present = record.get("present")
-            
-            if present:
-                cursor.execute("""
-                    INSERT INTO face_attendance (student_id, bus_id, time, status)
-                    VALUES (?, ?, ?, ?)
-                """, (reg_no, bus_id, current_time, "Present"))
-                conn.commit()
-        
-        return jsonify({"status": "success", "message": f"Attendance marked for {len(records)} students"})
-        
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-# ---------------- GET FACE ATTENDANCE HISTORY ----------------
-
-@app.route("/getFaceAttendance")
-def get_face_attendance():
-    return jsonify(face_attendance)
-
-# ---------------- VOICE ASSISTANT API ----------------
-
-@app.route("/voiceCommand", methods=["POST"])
-def voice_command():
-    data = request.json
-    command = data.get("command", "").lower()
-    bus_id = data.get("bus_id")
-    
-    if "location" in command or "where" in command:
-        if bus_id and bus_id in bus_locations:
-            loc = bus_locations[bus_id]
-            return jsonify({"response": f"Bus {bus_id} is at latitude {loc['latitude']:.6f} and longitude {loc['longitude']:.6f}"})
-        else:
-            return jsonify({"response": "Bus location not available"})
-    
-    elif "emergency" in command or "help" in command:
-        return jsonify({"response": f"Emergency alert sent for bus {bus_id}"})
-    
-    elif "status" in command:
-        if bus_id and bus_id in bus_locations:
-            if bus_id in bus_anomalies:
-                return jsonify({"response": f"Bus {bus_id} has an anomaly: {bus_anomalies[bus_id]['anomaly']}"})
-            else:
-                return jsonify({"response": f"Bus {bus_id} is running normally"})
-        else:
-            return jsonify({"response": "Bus status unknown"})
-    
-    elif "analytics" in command or "average" in command or "speed" in command:
-        avg_speed = sum(speed_records) / len(speed_records) if speed_records else 0
-        return jsonify({"response": f"Average bus speed is {round(avg_speed,2)} km/h. There are {len(bus_anomalies)} active anomalies."})
-    
-    elif "anomaly" in command or "problem" in command:
-        if bus_anomalies:
-            return jsonify({"response": f"There are {len(bus_anomalies)} active anomalies. {list(bus_anomalies.keys())} buses have issues."})
-        else:
-            return jsonify({"response": "No active anomalies detected."})
-    
-    elif "bus count" in command or "how many buses" in command:
-        return jsonify({"response": f"There are {len(bus_locations)} buses currently active."})
-    
-    elif "route" in command or "history" in command or "csv" in command:
-        return jsonify({"response": f"Route history available. Use download route feature in admin panel to get CSV report."})
-    
-    else:
-        return jsonify({"response": "Sorry, I didn't understand. Try: bus location, bus status, analytics, anomalies, emergency, route history, or bus count."})
-
-# ---------------- EMERGENCY ALERT ----------------
-
-@app.route("/emergency", methods=["POST"])
-def emergency():
-    data = request.json
-    print("Emergency from bus:", data["bus_id"])
-    return {"status":"alert sent"}
-
-# ---------------- BUS ENTRY / EXIT LOG ----------------
-
-@app.route("/logBus", methods=["POST"])
-def log_bus():
-    data = request.json
-    bus_id = data["bus_id"]
-    entry = data["entry_time"]
-    exit_time = data["exit_time"]
-    arrival = data["arrival_time"]
-    cursor.execute("""
-        INSERT INTO bus_log(bus_id,entry_time,exit_time,arrival_time)
-        VALUES(?,?,?,?)
-    """,(bus_id,entry,exit_time,arrival))
-    conn.commit()
-    return jsonify({"status":"saved"})
-
-# ---------------- GET LOGS ----------------
-
-@app.route("/getLogs")
-def get_logs():
-    cursor.execute("SELECT * FROM bus_log")
-    rows = cursor.fetchall()
-    logs = []
-    for r in rows:
-        logs.append({
-            "bus_id": r[1],
-            "entry_time": r[2],
-            "exit_time": r[3],
-            "arrival_time": r[4]
+        return jsonify({
+            "total_stops": len(df),
+            "columns": df.columns.tolist(),
+            "buses_with_stops": df['bus_id'].astype(str).unique().tolist(),
+            "sample_data": df.head(10).to_dict(orient="records")
         })
-    return jsonify(logs)
-
-# ---------------- DOWNLOAD REPORT ----------------
-
-@app.route("/downloadReport")
-def download_report():
-    cursor.execute("SELECT * FROM bus_log")
-    rows = cursor.fetchall()
-    filename = "bus_report.csv"
-    with open(filename,"w",newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(["Bus ID","Entry Time","Exit Time","Arrival Time"])
-        for r in rows:
-            writer.writerow([r[1],r[2],r[3],r[4]])
-    return send_file(filename,as_attachment=True)
-
-# ---------------- DASHBOARD ----------------
-
-@app.route("/dashboard")
-def dashboard():
-    active_buses = len(bus_locations)
-    total_students = sum(bus_boarded.values()) if bus_boarded else 0
-    anomaly_count = len(bus_anomalies)
-    
-    try:
-        cursor.execute("SELECT COUNT(*) FROM sos_alerts WHERE status = 'active'")
-        sos_count = cursor.fetchone()[0]
-    except:
-        sos_count = 0
-    
-    try:
-        cursor.execute("SELECT COUNT(*) FROM route_history")
-        route_count = cursor.fetchone()[0]
-    except:
-        route_count = 0
-    
-    avg_speed = sum(speed_records) / len(speed_records) if speed_records else 0
-
-    return jsonify({
-        "active_buses": active_buses,
-        "delayed_buses": 0,
-        "students": total_students,
-        "emergency": 0,
-        "anomalies": anomaly_count,
-        "sos_alerts": sos_count,
-        "route_points": route_count,
-        "average_speed": round(avg_speed, 2)
-    })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ---------------- RUN SERVER ----------------
 
@@ -1230,26 +1510,20 @@ if __name__ == "__main__":
     print(f"📊 Face Recognition: ✅ Lightweight Mode (OpenCV)")
     print(f"📁 Faces folder: {'faces/'}")
     print(f"📁 Excel file: {EXCEL_FILE}")
-    print(f"🔔 Geo-fencing: Enabled with {len(BUS_STOPS)} stops")
-    print(f"🚨 Anomaly detection: Active")
-    print(f"👨‍✈️ Driver behavior: Monitoring")
-    print(f"🎤 Voice assistant: Ready")
-    print(f"🚨 SOS Alerts: Active")
+    print(f"🚨 Anomaly detection: Active (Speed limit: {OVERSPEED_LIMIT} km/h)")
+    print(f"🚨 Emergency Alerts: Active")
     print(f"🗺️ Route History: Active")
-    print(f"📥 CSV Download: Active")
+    print(f"📍 College Location: {COLLEGE_LAT}, {COLLEGE_LON}")
     print("="*60)
     print("\n✅ Critical Endpoints:")
-    print("   📍 /getStudentsByBus/<bus_id> - GET STUDENTS")
-    print("   👤 /faceAttendance - Face recognition (Lightweight) - MAIN")
-    print("   👤 /recognizeFace - Face recognition (base64)")
-    print("   👨‍👩‍👧 /parentLogin - Parent login")
-    print("   👨‍👩‍👧 /parentData/<student_id> - Parent dashboard data")
-    print("   🚨 /sendAlert - SOS alert")
-    print("   🚍 /sendLocation - Update bus location")
-    print("   🗺️ /getRouteHistory/<bus_id> - Get route history")
-    print("   📥 /downloadRouteCSV/<bus_id> - Download route CSV")
+    print("   📍 /sendLocation - Update bus location")
+    print("   📍 /getStops/<bus_id> - Get stops for bus (from Excel)")
+    print("   👤 /getStudentsByBus/<bus_id> - Get students for bus")
+    print("   👤 /faceAttendance - Face recognition attendance")
+    print("   🚨 /sendEmergency - Send emergency alert")
     print("   📊 /dashboard - Dashboard data")
-    print("   🔥 /getAnomalies - Get active anomalies")
-    print("   📋 /markAttendance - Mark attendance")
+    print("   👨‍👩‍👧 /parentData/<student_id> - Parent view data")
+    print("   🗺️ /getRoutes/<bus_id> - Get routes by date")
+    print("   🔍 /debugStops - Debug stops data")
     print("="*60 + "\n")
     app.run(host="0.0.0.0", port=5000, debug=True)
