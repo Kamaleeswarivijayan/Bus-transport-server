@@ -1,4 +1,4 @@
-__##Smart Transportation Management System__
+##Smart Transportation Management System/
 
 📌 Overview
 
