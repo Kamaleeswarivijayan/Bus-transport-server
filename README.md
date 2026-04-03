@@ -110,13 +110,13 @@ Tables:
 
 📂 Project Structure
 
-transport-management-system/
-│
-├── student_bus_app/       # Flutter app
-├── server.py              # Backend server
-├── requirements.txt       # Python dependencies
-├── transport_data.xlsx    # Dataset (buses, stops, students)
-├── README.md              # Project documentation
+transport-management-system/                                                                                                                                      .
+│                                                                                                                                                                 .
+├── student_bus_app/       # Flutter app                                                                                                                          .
+├── server.py              # Backend server                                                                                                                       .
+├── requirements.txt       # Python dependencies                                                                                                                  .
+├── transport_data.xlsx    # Dataset (buses, stops, students)                                                                                                     .
+├── README.md              # Project documentation                                                                                                                .
 
 
 
